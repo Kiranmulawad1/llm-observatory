@@ -1,0 +1,109 @@
+# Local development stack.
+#
+#   make up       -> Postgres + Redis only. Run api/worker/web on the host with
+#                    hot reload. This is the fast inner loop.
+#   make up-all   -> everything containerised, including the app images. Slower,
+#                    but it exercises the same Dockerfiles that CI builds and
+#                    Kubernetes runs, so image bugs surface here and not in prod.
+#
+# Nothing in this file contains a secret. Values come from .env (gitignored);
+# .env.example documents every variable.
+
+name: llm-observatory
+
+services:
+  postgres:
+    # TimescaleDB is Postgres with an extension — same wire protocol, same
+    # asyncpg driver, same SQLAlchemy models. Adopted from day one so the span
+    # table can be a hypertable rather than a table we later have to migrate.
+    image: timescale/timescaledb:latest-pg17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lo_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-llm_observatory}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Runs once, on an empty data volume: creates the extension and the
+      # control/telemetry schemas. Table DDL is Alembic's job, not this script's.
+      - ./infra/docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lo} -d ${POSTGRES_DB:-llm_observatory}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7.4-alpine
+    # appendonly keeps queued jobs across a container restart. An eval job that
+    # vanishes because Redis restarted is exactly the silent failure we promised
+    # not to ship.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      LO_ENVIRONMENT: local
+      LO_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-lo}:${POSTGRES_PASSWORD:-lo_dev_password}@postgres:5432/${POSTGRES_DB:-llm_observatory}
+      LO_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      LO_ENVIRONMENT: local
+      LO_SERVICE_NAME: lo-worker
+      LO_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-lo}:${POSTGRES_PASSWORD:-lo_dev_password}@postgres:5432/${POSTGRES_DB:-llm_observatory}
+      LO_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    profiles: ["full"]
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    environment:
+      # Server-side only. The browser never sees the platform API base URL or key.
+      LO_API_BASE_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

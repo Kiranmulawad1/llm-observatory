@@ -1,0 +1,46 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*-key.json
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.pnpm-store/
+
+# Terraform — state can contain plaintext secrets and belongs in a remote backend
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+tfplan
+tfplan.*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

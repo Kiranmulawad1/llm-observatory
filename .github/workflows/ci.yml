@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to the same PR cancels the previous run. Without this, a busy PR
+# queues redundant jobs and the useful result is the one you wait longest for.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.11.16"
+
+jobs:
+  python-quality:
+    name: Python lint + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      # --frozen fails if uv.lock is stale relative to the pyproject files.
+      # Without it, CI would silently resolve different versions than the images.
+      - run: uv sync --all-packages --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy packages apps
+
+  sdk-boundary:
+    name: SDK dependency boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      # ADR 0001: the published SDK must not depend on platform-internal code.
+      # A stray `import lo_core` passes every local test and only breaks once a
+      # consumer installs from PyPI, so it is checked explicitly here.
+      - name: Reject platform imports in the SDK
+        run: |
+          if grep -rnE '^\s*(from|import)\s+(lo_core|lo_api|lo_worker)' packages/sdk/src; then
+            echo "::error::SDK must not import platform-internal packages (see ADR 0001)"
+            exit 1
+          fi
+      - name: Install the SDK alone and import it
+        run: |
+          uv venv /tmp/sdk-env
+          VIRTUAL_ENV=/tmp/sdk-env uv pip install ./packages/sdk
+          VIRTUAL_ENV=/tmp/sdk-env uv run --no-project python -c "import llm_observatory; print(llm_observatory.__version__)"
+
+  python-tests:
+    name: Python tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_USER: lo
+          POSTGRES_PASSWORD: lo_test_password
+          POSTGRES_DB: llm_observatory
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U lo -d llm_observatory"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      LO_ENVIRONMENT: local
+      LO_DATABASE_URL: postgresql+asyncpg://lo:lo_test_password@localhost:5432/llm_observatory
+      LO_REDIS_URL: redis://localhost:6379/0
+      LO_API_KEY_PEPPER: ci-test-pepper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --all-packages --frozen
+      # GitHub's `services:` cannot mount an init script, so the schemas that
+      # docker-compose creates via infra/docker/postgres-init are applied here.
+      - name: Create extension and schemas
+        run: |
+          PGPASSWORD=lo_test_password psql -h localhost -U lo -d llm_observatory \
+            -f infra/docker/postgres-init/01-init.sql
+      - run: uv run pytest --cov=packages --cov=apps --cov-report=term-missing
+
+  web-quality:
+    name: Web lint + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  images:
+    name: Build images
+    runs-on: ubuntu-latest
+    # Images are only worth building once the code that goes in them is sound.
+    needs: [python-quality, python-tests, web-quality]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            dockerfile: apps/api/Dockerfile
+            context: .
+          - name: worker
+            dockerfile: apps/worker/Dockerfile
+            context: .
+          - name: web
+            dockerfile: apps/web/Dockerfile
+            context: ./apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          # CI proves the image builds; pushing and deploying belong to cd.yml,
+          # which gates on a manual approval before terraform apply (Phase 10).
+          push: false
+          load: true
+          tags: lo-${{ matrix.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

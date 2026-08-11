@@ -1,0 +1,105 @@
+[project]
+name = "llm-observatory"
+version = "0.1.0"
+description = "Self-hosted LLM evaluation and observability platform"
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/core", "packages/sdk", "apps/api", "apps/worker"]
+
+[tool.uv.sources]
+lo-core = { workspace = true }
+llm-observatory-sdk = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "lo-core",
+    "llm-observatory-sdk",
+    "lo-api",
+    "lo-worker",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "httpx>=0.28",
+    "testcontainers[postgres,redis]>=4.9",
+    "ruff>=0.9",
+    "mypy>=1.14",
+]
+
+[tool.uv.sources.lo-api]
+workspace = true
+
+[tool.uv.sources.lo-worker]
+workspace = true
+
+# ---------------------------------------------------------------------------
+# Shared tooling config. Every workspace member inherits these; no per-package
+# lint config drift.
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+# Ruff reformats fenced code blocks inside Markdown. Docs examples are written
+# for a human reader, not to satisfy the formatter, so they stay out of scope.
+extend-exclude = ["*.md"]
+src = [
+    "packages/core/src",
+    "packages/sdk/src",
+    "apps/api/src",
+    "apps/worker/src",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "ASYNC",# flake8-async — catches blocking calls in async defs
+    "S",    # bandit — security
+    "T20",  # no stray print()
+    "RUF",
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter, not the linter
+    "B008",  # FastAPI's Depends() in defaults is idiomatic
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]  # asserts and dummy creds are fine in tests
+# RUF012 wants ClassVar annotations on mutable class attributes. These two are
+# framework-dictated names read off the class dict by SQLAlchemy and arq
+# respectively; annotating them conflicts with the base classes those frameworks
+# already declare, so the rule is scoped off rather than worked around.
+"packages/core/src/lo_core/db/base.py" = ["RUF012"]
+"apps/worker/src/lo_worker/main.py" = ["RUF012"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+mypy_path = [
+    "packages/core/src",
+    "packages/sdk/src",
+    "apps/api/src",
+    "apps/worker/src",
+]
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "arq.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: requires live Postgres/Redis (docker compose up db redis)",
+]
