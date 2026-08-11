@@ -16,6 +16,8 @@ resource policies, which is the real reason they cannot share a schema forever.
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import MetaData
 from sqlalchemy.orm import DeclarativeBase
 
@@ -40,15 +42,24 @@ class Base(DeclarativeBase):
     metadata = metadata
 
 
+# SQLAlchemy accepts `__table_args__` as either a dict of table keyword
+# arguments or a tuple of constraints ending in that dict. The abstract bases
+# below supply the dict form, but concrete tables that declare constraints must
+# override with the tuple form — so the attribute is annotated loosely here.
+# Without this, mypy infers `dict[str, str]` from the bases and rejects every
+# subclass that adds a UniqueConstraint.
+TableArgs = Any
+
+
 class ControlBase(Base):
     """Mixin marker for tables in the `control` schema."""
 
     __abstract__ = True
-    __table_args__ = {"schema": CONTROL_SCHEMA}
+    __table_args__: TableArgs = {"schema": CONTROL_SCHEMA}
 
 
 class TelemetryBase(Base):
     """Mixin marker for tables in the `telemetry` schema."""
 
     __abstract__ = True
-    __table_args__ = {"schema": TELEMETRY_SCHEMA}
+    __table_args__: TableArgs = {"schema": TELEMETRY_SCHEMA}

@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap up up-all down clean api worker web lint fmt typecheck test test-unit logs psql redis-cli
+.PHONY: help bootstrap up up-all down clean api worker web lint fmt typecheck test test-unit logs psql redis-cli migrate migration downgrade
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -23,6 +23,17 @@ down: ## Stop all services, keep data volumes
 
 clean: ## Stop everything and DELETE the data volumes
 	docker compose --profile full down -v
+
+migrate: ## Apply all pending migrations
+	uv run alembic upgrade head
+
+migration: ## Autogenerate a migration: make migration m="add traces"
+	@test -n "$(m)" || (echo 'usage: make migration m="short description"' && exit 1)
+	uv run alembic revision --autogenerate -m "$(m)"
+	@echo "Review the generated file before committing — check the downgrade()."
+
+downgrade: ## Roll back exactly one migration
+	uv run alembic downgrade -1
 
 api: ## Run the API on the host with hot reload
 	uv run uvicorn lo_api.main:app --reload --host 0.0.0.0 --port 8000

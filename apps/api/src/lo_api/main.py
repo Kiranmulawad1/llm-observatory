@@ -8,8 +8,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from lo_api.errors import register_exception_handlers
 from lo_api.middleware.request_context import RequestContextMiddleware
-from lo_api.routers import health
+from lo_api.routers import health, projects, prompts
 from lo_core.config import get_settings
 from lo_core.db import dispose_engine
 from lo_core.logging import configure_logging, get_logger
@@ -57,7 +58,11 @@ def create_app() -> FastAPI:
             allow_headers=["*"],
         )
 
+    register_exception_handlers(app)
+
     app.include_router(health.router)
+    app.include_router(projects.router)
+    app.include_router(prompts.router)
 
     return app
 

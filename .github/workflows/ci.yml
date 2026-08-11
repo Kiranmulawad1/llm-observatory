@@ -90,12 +90,30 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
       - run: uv sync --all-packages --frozen
-      # GitHub's `services:` cannot mount an init script, so the schemas that
-      # docker-compose creates via infra/docker/postgres-init are applied here.
+      # GitHub's `services:` cannot mount an init script, so the TimescaleDB
+      # extension that docker-compose installs via infra/docker/postgres-init is
+      # applied here. The schemas themselves are created by the migration runner
+      # (see migrations/env.py), so this step is only about the extension.
       - name: Create extension and schemas
         run: |
           PGPASSWORD=lo_test_password psql -h localhost -U lo -d llm_observatory \
             -f infra/docker/postgres-init/01-init.sql
+      - name: Apply migrations
+        run: uv run alembic upgrade head
+      # Migrations must be reversible, and the only way to know is to run the
+      # downgrade. Doing it on an empty CI database is free; discovering a broken
+      # downgrade during a production rollback is not. The re-upgrade leaves the
+      # schema in place for the test run that follows.
+      - name: Verify migrations are reversible
+        run: |
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+      # Fails if a model was changed without generating the matching migration.
+      # That mistake is invisible locally — the developer's database already has
+      # the column, because SQLAlchemy never needed it to exist in a migration —
+      # and only surfaces as a broken deploy against a fresh database.
+      - name: Check models and migrations agree
+        run: uv run alembic check
       - run: uv run pytest --cov=packages --cov=apps --cov-report=term-missing
 
   web-quality:

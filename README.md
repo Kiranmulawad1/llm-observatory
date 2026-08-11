@@ -119,6 +119,7 @@ Requires Docker, Python 3.13+, [uv](https://docs.astral.sh/uv/), and Node 24+.
 git clone <repo> && cd llm-observatory
 make bootstrap        # .env from .env.example, uv sync, npm install
 make up               # Postgres (TimescaleDB) + Redis
+make migrate          # alembic upgrade head
 ```
 
 Then, in three terminals:
@@ -147,11 +148,56 @@ Host ports default to **5433** (Postgres) and **6380** (Redis) so the stack
 coexists with another project's database on the standard ports.
 
 ```bash
-make test         # pytest
+make test         # pytest (integration tests need `make up && make migrate`)
+make test-unit    # unit tests only — no Postgres or Redis required
 make lint         # ruff check + format --check (identical to CI)
 make typecheck    # mypy strict
 make help         # everything else
 ```
+
+### Trying the prompt registry
+
+```bash
+curl -X POST localhost:8000/projects \
+  -H 'content-type: application/json' \
+  -d '{"slug":"demo","name":"Demo"}'
+
+curl -X POST localhost:8000/projects/demo/prompts \
+  -H 'content-type: application/json' \
+  -d '{"slug":"support-triage","name":"Support triage"}'
+
+# Versions are immutable — this appends v1 rather than editing anything
+curl -X POST localhost:8000/projects/demo/prompts/support-triage/versions \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"system","content":"You are terse."},
+                   {"role":"user","content":"{{ question }}"}],
+       "parameters":{"model":"claude-opus-5","temperature":0.0}}'
+
+# Promote it. Idempotent, so a retried deploy is safe.
+curl -X PUT localhost:8000/projects/demo/prompts/support-triage/labels/production \
+  -H 'content-type: application/json' -d '{"version":1}'
+
+# Render by label, exactly as the eval runner and SDK will
+curl -X POST localhost:8000/projects/demo/prompts/support-triage/versions/production/render \
+  -H 'content-type: application/json' \
+  -d '{"variables":{"question":"Where is my order?"}}'
+
+# After adding a v2: what am I about to ship?
+curl 'localhost:8000/projects/demo/prompts/support-triage/diff?from=production&to=2'
+```
+
+### Migrations
+
+```bash
+make migrate                        # apply everything pending
+make migration m="add eval runs"    # autogenerate, then review the downgrade
+make downgrade                      # roll back one revision
+```
+
+Schemas are created by the migration runner, not by the Docker init script, so
+`alembic upgrade head` works against any empty database — including managed
+Cloud SQL, where no entrypoint script ever runs. CI additionally proves every
+migration is reversible and that no model change is missing a migration.
 
 ---
 
@@ -182,7 +228,7 @@ These are the rules the codebase actually enforces, not aspirations:
 | Phase | Scope | State |
 | ----- | ----- | ----- |
 | 1 | Scaffolding, workspace, docker-compose, health, CI | ✅ Done |
-| 2 | Prompt registry + versioning + diffs | Next |
+| 2 | Prompt registry + versioning + diffs (API) | ✅ Done |
 | 3 | Eval engine: datasets, evaluator plugins, async runner | |
 | 4 | LLM-as-judge, retrieval metrics, run comparison | |
 | 5 | Tracing SDK, ingest API, nested spans | |
@@ -197,3 +243,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0001 — Workspace and package boundaries](docs/adr/0001-workspace-and-package-boundaries.md)
 - [ADR 0002 — Arq over Celery](docs/adr/0002-task-queue.md)
 - [ADR 0003 — TimescaleDB for spans](docs/adr/0003-trace-storage.md)
+- [ADR 0004 — Immutable prompt versions, movable labels](docs/adr/0004-prompt-versioning-model.md)
