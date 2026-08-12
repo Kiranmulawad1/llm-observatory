@@ -11,7 +11,14 @@ from __future__ import annotations
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from lo_core.errors import ConflictError, NotFoundError, ValidationError
+from lo_core.errors import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    RateLimitError,
+    UnauthorizedError,
+    ValidationError,
+)
 from lo_core.logging import get_logger
 
 log = get_logger(__name__)
@@ -35,6 +42,27 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ConflictError)
     async def _conflict(request: Request, exc: ConflictError) -> JSONResponse:
         return _problem(status.HTTP_409_CONFLICT, "conflict", str(exc))
+
+    @app.exception_handler(UnauthorizedError)
+    async def _unauthorized(request: Request, exc: UnauthorizedError) -> JSONResponse:
+        response = _problem(status.HTTP_401_UNAUTHORIZED, "unauthorized", str(exc))
+        # RFC 9110 requires this header on a 401. Without it a client cannot
+        # tell which scheme to authenticate with.
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+
+    @app.exception_handler(ForbiddenError)
+    async def _forbidden(request: Request, exc: ForbiddenError) -> JSONResponse:
+        return _problem(status.HTTP_403_FORBIDDEN, "forbidden", str(exc))
+
+    @app.exception_handler(RateLimitError)
+    async def _rate_limited(request: Request, exc: RateLimitError) -> JSONResponse:
+        response = _problem(status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited", str(exc))
+        # Tells the SDK exactly how long to back off, instead of leaving it to
+        # guess — and a guessing client under load is how a rate limit turns
+        # into a thundering herd.
+        response.headers["Retry-After"] = str(exc.retry_after)
+        return response
 
     @app.exception_handler(ValidationError)
     async def _validation(request: Request, exc: ValidationError) -> JSONResponse:

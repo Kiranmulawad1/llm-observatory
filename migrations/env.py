@@ -98,6 +98,15 @@ def include_name(name: str | None, type_: NameType, parent_names: ParentNames) -
         return name in MANAGED_SCHEMAS
     if type_ == "table":
         return parent_names.get("schema_name") in MANAGED_SCHEMAS
+    if type_ == "index":
+        # TimescaleDB creates its own descending index on a hypertable's time
+        # column (`<table>_started_at_idx`) when the table is converted. It is
+        # not in our SQLAlchemy metadata, so autogenerate sees it as an index
+        # the database has and the models do not — and proposes dropping it on
+        # every single migration. Dropping it would gut hypertable query
+        # performance, so it is excluded from comparison entirely.
+        if name is not None and name.endswith("_started_at_idx"):
+            return parent_names.get("schema_name") != TELEMETRY_SCHEMA
     return True
 
 

@@ -908,10 +908,10 @@ The trap is describing *features*. Describe **decisions and their consequences**
 | 2 | Prompt registry, versions, labels, diffs | ✅ |
 | 3 | Eval engine, datasets, evaluators, async runner | ✅ |
 | 4 | Judge, retrieval metrics, run comparison | ✅ |
-| 5 | Tracing SDK, ingest API, nested spans | next |
-| 6 | Observability dashboard (Next.js) | |
+| 5 | Tracing SDK, ingest API, nested spans | ✅ |
+| 6 | Observability dashboard (Next.js) + alerting | next |
 | 7 | Guardrail sampling, review queue, flywheel | |
-| 8 | API keys per project, auth everywhere | |
+| 8 | API keys per project, auth everywhere | partial (ingest done) |
 | 9 | Kubernetes manifests, Terraform for GCP | |
 | 10 | CI/CD with plan → approve → apply | |
 
@@ -926,7 +926,354 @@ building them together avoids doing the diff UI twice.
 
 ---
 
-## 10. Where to look when you're stuck
+## 10. Phase 5 — tracing, explained
+
+This phase is different from everything before it, and the difference is worth
+understanding before the details.
+
+**Phases 1–4 wrote to the `control` schema.** Prompts, datasets, eval runs. Low
+volume, transactional, foreign keys everywhere, and *you* controlled every write.
+
+**Phase 5 writes to `telemetry`.** Traces from production. High volume,
+append-only, and written by code running inside **someone else's application**.
+That last part changes what "correct" means, and it drives most of what follows.
+
+### 10.1 What a trace actually is
+
+A **trace** is one end-to-end request. A **span** is one operation inside it.
+
+Your RAG app answering a question is one trace containing four spans:
+
+```
+answer_question                (chain,     820ms)
+├── retrieval                  (retrieval, 120ms)
+│   └── rerank                 (rerank,     45ms)
+└── anthropic.messages.create  (llm,       640ms)
+```
+
+Compare that to a log line saying `answered question in 820ms`. The log tells you
+it was slow. The trace tells you **the model call was 78% of it**, so tuning your
+retriever would be wasted effort.
+
+### 10.2 How the tree is stored (it's flat)
+
+Here's the thing that surprises people: **the tree is not stored as a tree.**
+Every span is a flat row with two id columns:
+
+| span_id | parent_span_id | name |
+| --- | --- | --- |
+| `a1b2...` | `null` | answer_question |
+| `c3d4...` | `a1b2...` | retrieval |
+| `e5f6...` | `c3d4...` | rerank |
+| `g7h8...` | `a1b2...` | anthropic.messages.create |
+
+`parent_span_id` **is** the entire tree structure. The root is the row where it's
+null. The tree gets rebuilt on read.
+
+**Why flat instead of nested JSON?** Because flat rows are queryable. "What's the
+p95 latency of every retrieval step across all traces this week?" is:
+
+```sql
+SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)
+FROM telemetry.spans
+WHERE kind = 'retrieval' AND started_at > now() - interval '7 days'
+```
+
+With nested JSON you'd have to load and walk every trace to answer that.
+
+**Why these specific id formats?** 32 hex chars for a trace, 16 for a span —
+that's the W3C Trace Context standard, the same one OpenTelemetry uses. Free
+interoperability: a team already running OTel has ids that line up with ours.
+Inventing our own would have bought nothing.
+
+### 10.3 Hypertables, and the constraint they impose
+
+`telemetry.spans` is a **TimescaleDB hypertable** — a table Postgres
+automatically splits into chunks by time (one chunk per day here).
+
+Two benefits:
+- A query with a time filter skips every chunk outside it.
+- Old chunks can be compressed or dropped as whole units instead of row-by-row.
+
+**But there's a catch, and it's a good interview story.** Timescale requires the
+partitioning column to be part of every unique index. So spans *cannot* have the
+simple UUID primary key every other table in this codebase uses:
+
+```python
+# Every table in `control`:
+id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+
+# Spans, because they're partitioned on time:
+PrimaryKeyConstraint("started_at", "span_id")
+```
+
+That inconsistency isn't sloppiness — it's the price of partitioning, and it's
+exactly why ADR 0003 argued for keeping `control` and `telemetry` in separate
+schemas from day one.
+
+**Two more wrinkles I hit:**
+
+Timescale creates its *own* index on the time column. Alembic saw an index in the
+database that wasn't in our models and proposed dropping it — on every migration,
+forever. `migrations/env.py` now filters it out.
+
+And I deliberately did **not** put retention policies in the migration. A line
+like `add_retention_policy('spans', INTERVAL '90 days')` in a migration would
+silently delete a customer's data the moment you deploy. That's an operational
+setting, not a schema change.
+
+### 10.4 The `traces` rollup table
+
+There's a second table holding per-trace totals: duration, cost, tokens, status.
+
+**Why not compute it on demand?** Because the dashboard asking "show me the last
+50 traces" would aggregate raw spans on every page load — against the one table
+that grows without bound.
+
+**Why recompute instead of incrementing?** This one is subtle. Spans arrive *out
+of order*: a child span finishes before its parent, so it gets flushed first. And
+a late span can change the totals after the root already arrived. If you added
+deltas incrementally, the rollup would drift from reality with nothing to detect
+it. Recomputing from scratch costs one query per trace per batch — cheap, because
+a trace has tens of spans, not millions.
+
+One rule worth noting: **if any span errored, the whole trace is an error.** A
+request whose retrieval timed out but still returned something is not a success.
+Counting it as one is exactly how error-rate dashboards start lying.
+
+### 10.5 API keys (pulled forward from Phase 8)
+
+I pushed back on your build order here. Ingestion is a **public write endpoint** —
+the only one in the system an external app calls over the internet. Shipping it
+unauthenticated, even temporarily, means anyone can forge traces into any
+project. And the SDK's auth contract would have to change later, breaking every
+app that already integrated.
+
+**How keys work:**
+
+```
+lo_live_XZ8kQm2p...        <- returned ONCE at creation, never again
+        ^^^^^^^^^^^^^^^^
+        stored: sha256(key + server pepper)
+        stored in clear: first 16 chars, for lookup + display
+```
+
+**Why SHA-256 and not bcrypt?** This one's worth being able to explain, because
+"always use bcrypt" is the usual reflex and it's wrong here.
+
+bcrypt is deliberately *slow* to make guessing expensive. That's right for a
+password — a human picked it, so it might have 30 bits of entropy. An API key
+here is 256 bits from the OS random generator. Guessing it isn't a threat model
+at any hash speed.
+
+Meanwhile this hash is verified on **every single ingest request**. A 100ms KDF
+would cap you at ~10 spans/second/core. So: fast hash, plus a server-side pepper
+that lives in config and never in the database. The pepper does what bcrypt's
+salt would — a stolen database alone can't verify guesses offline.
+
+**Three more details worth knowing:**
+
+```python
+if not hmac.compare_digest(key.key_hash, expected):
+```
+Not `==`. String equality stops at the first differing byte, so *how long it took
+to fail* leaks how much of a guess was right. Enough attempts and you reconstruct
+the key a byte at a time.
+
+```python
+return await service.ingest_spans(session, key.project_id, payload.spans)
+                                            ^^^^^^^^^^^^^^
+```
+The project comes from **the key**, never from the request body. A client
+physically cannot write into a project it doesn't hold a key for.
+
+And revocation is a timestamp, not a `DELETE` — traces stay attributable to a
+credential you can still account for.
+
+### 10.6 The SDK, and its one non-negotiable rule
+
+> **Instrumentation must never break, block, or slow the app it's instrumenting.**
+
+An observability tool that takes down the service it observes is worse than
+having no observability tool. Every design choice in `packages/sdk/` follows from
+that single sentence:
+
+| Choice | Because |
+| --- | --- |
+| Bounded queue (10k spans) | If the platform is down, an unbounded buffer grows until the host process is OOM-killed. Your tracing library would have caused the outage. |
+| `put_nowait`, never `put` | Blocking would push *our* backpressure into *their* request handler. |
+| Drop oldest, count the loss | Recent telemetry beats a stale backlog during an incident — and the count makes the loss visible instead of silent. |
+| Daemon **thread**, not asyncio | The host app might be Flask (sync) or FastAPI (async). A thread works in both. An asyncio flusher needs a running loop and simply wouldn't work in half of them. |
+| `daemon=True` | A hung flush must never stop the process from exiting. Shutdown gets a *bounded* drain window, then gives up. |
+| Every call wrapped in try/except | A bug here, a network failure, a weird payload — none of it reaches the caller's stack. |
+| Inert with no API key | Importing this into an unconfigured project costs nothing and fails nowhere. |
+| Payloads truncated at 32k | A span's input can be an entire retrieved corpus. Nobody wants their tracing tool to be why a request body is 50MB. |
+
+There's a test that captures the whole point:
+
+```python
+def test_unreachable_endpoint_does_not_break_the_caller(self):
+    configure(api_key="...", endpoint="http://192.0.2.1:9")  # dead port
+
+    @trace("business_logic")
+    def business_logic(x): return x * 2
+
+    assert business_logic(21) == 42      # your code still works
+```
+
+### 10.7 How nesting works without you passing anything
+
+This is the cleverest bit of the SDK. You write:
+
+```python
+with span("retrieval"):
+    with span("rerank"):     # <- how does this know its parent?
+        ...
+```
+
+You never pass a parent. It works via a **`ContextVar`** — a variable scoped to
+the current execution context:
+
+```python
+_current_span: ContextVar[Span | None] = ContextVar("lo_current_span", default=None)
+```
+
+When a span opens it sets itself as current and remembers the old value; when it
+closes it restores. Any span opened in between sees it as the parent.
+
+**Why a ContextVar and not a thread-local?** This matters and it's a good
+interview answer. A ContextVar is inherited by asyncio tasks, so:
+
+- nesting survives an `await`
+- concurrent tasks each get their *own* view
+
+A thread-local would give every coroutine running on one event-loop thread the
+**same** "current span" — so ten concurrent requests would all appear nested
+under whichever one happened to open a span first. A trace tree that is
+confidently wrong, which is worse than no tree at all. There's a test for exactly
+this (`test_concurrent_tasks_do_not_share_a_parent`).
+
+### 10.8 Auto-instrumentation
+
+```python
+client = instrument(Anthropic())
+```
+
+After that, every `client.messages.create(...)` becomes a span with model, token
+counts, latency and stop reason — no code change at the call site.
+
+It's a **proxy**, not a subclass:
+
+```python
+class _InstrumentedClient:
+    def __getattr__(self, item):
+        value = getattr(self._wrapped, item)
+        if item == "messages":
+            return _InstrumentedMessages(value)
+        return value          # everything else passes straight through
+```
+
+Subclassing would mean tracking the vendor SDK's entire surface as it changes.
+Proxying means we wrap the one method we care about and everything else keeps
+working when Anthropic ships a new feature.
+
+The response parsing is defensive everywhere — if a vendor rename breaks it, you
+get a span with less detail, never a crashed model call.
+
+### 10.9 Rate limiting, and why it fails *open*
+
+Per project, sliding window in Redis, cost = **span count** (not request count —
+otherwise 500-span batches sent a thousand times a minute stay under a
+request-count limit while writing half a million rows).
+
+The interesting decision:
+
+```python
+except Exception as exc:
+    log.warning("ratelimit.unavailable", error=str(exc))
+    return RateLimitResult(allowed=True, ...)      # fail OPEN
+```
+
+If Redis is down, requests are **allowed through**. A rate limiter protects
+against abuse; it isn't a correctness mechanism. Refusing all telemetry because
+the limiter is unavailable turns a degraded dependency into an outage — and
+losing observability data during an incident is precisely the wrong failure mode.
+
+### 10.10 Follow a span from your app to the database
+
+1. Your code enters `with span("retrieval")`.
+2. SDK reads the ContextVar, finds the parent, generates a span id, starts a
+   monotonic timer.
+3. Your code runs. On exit, the span records its duration and any exception.
+4. It's pushed onto the bounded queue — **non-blocking**, your code moves on.
+5. A background thread wakes (100 spans buffered, or 2 seconds elapsed) and POSTs
+   a batch to `/v1/traces`.
+6. The API verifies the `Bearer` key → gets a `project_id`.
+7. Rate limit check, costed by span count.
+8. Spans upserted with `ON CONFLICT DO NOTHING` (retries are safe).
+9. For each touched trace, the rollup is recomputed.
+10. `GET /projects/{p}/traces/{id}` reads the flat rows back and rebuilds the tree.
+
+Step 4 is the one that matters. Everything after it happens on a different
+thread; your request already returned.
+
+### 10.11 What's new in the file map
+
+| File | What it does |
+| --- | --- |
+| `db/models/api_key.py` | The keys table, and the hash-choice rationale |
+| `db/models/telemetry.py` | `spans` + `traces`, both hypertables |
+| `services/api_keys.py` | Mint, verify (constant-time), revoke |
+| `services/traces.py` | Ingest, rollup refresh, tree assembly |
+| `ratelimit.py` | Redis sliding window, fails open |
+| `apps/api/routers/traces.py` | `POST /v1/traces` + query endpoints |
+| `apps/api/routers/api_keys.py` | Key issuance and revocation |
+| `packages/sdk/.../_span.py` | Span data model + the ContextVar |
+| `packages/sdk/.../_client.py` | Bounded queue + background flusher |
+| `packages/sdk/.../_tracing.py` | `span()`, `@trace`, `instrument()` |
+
+### 10.12 More interview answers
+
+**"How do you store a trace tree?"**
+> Flat rows with a nullable parent pointer, OpenTelemetry-style, reassembled on
+> read. Nested JSON would make the tree easy to fetch and impossible to query —
+> and the queries are the point. "p95 latency of every retrieval span this week"
+> is an indexed `WHERE` clause instead of loading and walking every trace.
+
+**"Why is the spans table shaped differently from everything else?"**
+> It's a Timescale hypertable partitioned on time, and Timescale requires the
+> partitioning column in every unique index — so it's a composite `(started_at,
+> span_id)` key rather than a UUID. That's the cost of partitioning, and it's why
+> telemetry got its own schema in the first migration rather than sharing one
+> with the control plane.
+
+**"Why SHA-256 for API keys instead of bcrypt?"**
+> Slow hashing protects low-entropy human-chosen secrets. These keys are 256 bits
+> of CSPRNG output, so guessing isn't a threat model at any speed — and the hash
+> is verified on the hottest endpoint in the system, where a 100ms KDF would cap
+> throughput at ten spans a second per core. A server-side pepper covers what
+> bcrypt's salt would: a stolen database alone can't verify guesses offline.
+
+**"How do you guarantee the SDK can't break a customer's app?"**
+> Bounded queue with non-blocking submit, a daemon thread so a hung flush can't
+> block exit, every public call wrapped, and completely inert without a key. The
+> test points it at a closed port and asserts the host function still returns the
+> right answer.
+
+**"Why a ContextVar for span nesting?"**
+> It's inherited by asyncio tasks, so nesting survives an `await` and concurrent
+> tasks stay independent. A thread-local would give every coroutine on one
+> event-loop thread the same parent — a tree that's confidently wrong, which is
+> worse than no tree.
+
+**"Why does your rate limiter fail open?"**
+> It protects against abuse; it isn't a correctness mechanism. Rejecting all
+> telemetry because Redis is down turns a degraded dependency into an outage, and
+> the worst time to lose observability is during an incident.
+
+---
+
+## 11. Where to look when you're stuck
 
 - **Why was this done this way?** → `docs/adr/` — one file per decision, each
   with the alternatives I rejected and why.

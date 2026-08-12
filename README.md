@@ -263,6 +263,47 @@ Retrieval metrics read the retrieved passages from a dataset field
 (`retrieved_context` by default) and compare them against `expected_context`.
 They need no model call, so they are cheap enough to gate every commit on.
 
+### Tracing your own app
+
+Issue a key, then instrument in three lines:
+
+```bash
+curl -X POST localhost:8000/projects/demo/api-keys \
+  -H 'content-type: application/json' -d '{"name":"my-app"}' | jq -r .key
+# lo_live_...  <- shown once, never retrievable again
+```
+
+```python
+from anthropic import Anthropic
+from llm_observatory import configure, instrument, trace, span
+
+configure(api_key="lo_live_...", endpoint="http://localhost:8000")
+client = instrument(Anthropic())          # every model call becomes a span
+
+@trace("answer_question")
+def answer(question: str) -> str:
+    with span("retrieval", kind="retrieval") as s:
+        docs = retriever(question)
+        s.set_output(docs)                # nested under answer_question
+
+    return client.messages.create(        # nested too, with tokens and cost
+        model="claude-opus-5", max_tokens=1024,
+        messages=[{"role": "user", "content": question}],
+    )
+```
+
+Then read the tree back:
+
+```bash
+curl -s localhost:8000/projects/demo/traces | jq '.[0]'
+curl -s localhost:8000/projects/demo/traces/<trace-id> | jq '.root'
+```
+
+**The SDK cannot break your application.** Bounded queue, background daemon
+thread, drop-and-count on overflow, never raises into the caller, and completely
+inert when `LO_API_KEY` is unset. Point it at a dead endpoint and your code runs
+exactly as before — there is a test that asserts precisely that.
+
 ### Migrations
 
 ```bash
@@ -308,10 +349,10 @@ These are the rules the codebase actually enforces, not aspirations:
 | 2 | Prompt registry + versioning + diffs (API) | ✅ Done |
 | 3 | Eval engine: datasets, evaluator plugins, async runner | ✅ Done |
 | 4 | LLM-as-judge, retrieval metrics, run comparison | ✅ Done |
-| 5 | Tracing SDK, ingest API, nested spans | |
+| 5 | Tracing SDK, ingest API, nested spans | ✅ Done |
 | 6 | Observability dashboard | |
 | 7 | Guardrail sampling, review queue, labelling flywheel | |
-| 8 | API keys per project, auth across all endpoints | |
+| 8 | API keys per project, auth across all endpoints | partial (ingest done) |
 | 9 | Kubernetes manifests, Terraform for GCP | |
 | 10 | CD with plan → manual approval → apply | |
 
@@ -323,3 +364,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0004 — Immutable prompt versions, movable labels](docs/adr/0004-prompt-versioning-model.md)
 - [ADR 0005 — Eval engine: execution, evaluators, providers](docs/adr/0005-eval-engine.md)
 - [ADR 0006 — Judges as prompts, retrieval metrics, comparison](docs/adr/0006-judge-retrieval-comparison.md)
+- [ADR 0007 — Tracing: spans, ingestion, the SDK contract](docs/adr/0007-tracing-and-ingestion.md)
