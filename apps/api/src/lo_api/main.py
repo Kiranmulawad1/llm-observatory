@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from lo_api.errors import register_exception_handlers
 from lo_api.middleware.request_context import RequestContextMiddleware
-from lo_api.routers import health, projects, prompts
+from lo_api.queue import close_pool
+from lo_api.routers import datasets, evaluation, health, projects, prompts
 from lo_core.config import get_settings
 from lo_core.db import dispose_engine
 from lo_core.logging import configure_logging, get_logger
@@ -26,6 +27,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings.assert_production_safe()
     log.info("api.startup", environment=settings.environment)
     yield
+    # Drain both pools so a terminating pod releases its Postgres and Redis
+    # connections rather than leaving the servers to time them out.
+    await close_pool()
     await dispose_engine()
     log.info("api.shutdown")
 
@@ -63,6 +67,8 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(projects.router)
     app.include_router(prompts.router)
+    app.include_router(datasets.router)
+    app.include_router(evaluation.router)
 
     return app
 

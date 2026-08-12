@@ -171,7 +171,11 @@ curl -X POST localhost:8000/projects/demo/prompts/support-triage/versions \
   -H 'content-type: application/json' \
   -d '{"messages":[{"role":"system","content":"You are terse."},
                    {"role":"user","content":"{{ question }}"}],
-       "parameters":{"model":"claude-opus-5","temperature":0.0}}'
+       "parameters":{"model":"claude-opus-5"}}'
+# Note: no `temperature`. Current Anthropic models reject sampling parameters
+# with a 400, and the platform validates that pairing when an eval run is
+# requested — so a stored prompt carrying `temperature` fails fast with one
+# clear error instead of once per example, mid-run.
 
 # Promote it. Idempotent, so a retried deploy is safe.
 curl -X PUT localhost:8000/projects/demo/prompts/support-triage/labels/production \
@@ -185,6 +189,42 @@ curl -X POST localhost:8000/projects/demo/prompts/support-triage/versions/produc
 # After adding a v2: what am I about to ship?
 curl 'localhost:8000/projects/demo/prompts/support-triage/diff?from=production&to=2'
 ```
+
+### Running an eval
+
+```bash
+# A dataset (CSV or JSON; every non-reserved column becomes a template variable)
+printf 'question,answer\nWhere is my order?,Shipped\nWhen will it arrive?,Tuesday\n' > /tmp/qa.csv
+
+curl -X POST localhost:8000/projects/demo/datasets \
+  -H 'content-type: application/json' \
+  -d '{"slug":"support-qa","name":"Support QA"}'
+
+curl -X POST localhost:8000/projects/demo/datasets/support-qa/versions/upload \
+  -F file=@/tmp/qa.csv
+
+# What can I score with?
+curl -s localhost:8000/evaluators | jq '.[].type'
+
+# Start a run. Returns 202 + a run id; the worker executes it.
+curl -X POST localhost:8000/projects/demo/eval/runs \
+  -H 'content-type: application/json' \
+  -d '{"dataset":"support-qa",
+       "prompt":"support-triage","prompt_version":"production",
+       "evaluators":[{"type":"embedding_similarity","config":{"threshold":0.6}},
+                     {"type":"regex_match","config":{"pattern":"."}}],
+       "generation_provider":"fake"}'
+
+# Poll for progress and per-example results
+curl -s localhost:8000/projects/demo/eval/runs/<run-id> | jq '{status, aggregate_scores}'
+
+# Jobs that exhausted their retries
+curl -s localhost:8000/dead-letters
+```
+
+`generation_provider` defaults to `fake` — deterministic, free, no API key — so
+the whole flow above runs offline. Set `LO_ANTHROPIC_API_KEY` and pass
+`"generation_provider":"anthropic"` to evaluate against a real model.
 
 ### Migrations
 
@@ -229,7 +269,7 @@ These are the rules the codebase actually enforces, not aspirations:
 | ----- | ----- | ----- |
 | 1 | Scaffolding, workspace, docker-compose, health, CI | ✅ Done |
 | 2 | Prompt registry + versioning + diffs (API) | ✅ Done |
-| 3 | Eval engine: datasets, evaluator plugins, async runner | |
+| 3 | Eval engine: datasets, evaluator plugins, async runner | ✅ Done |
 | 4 | LLM-as-judge, retrieval metrics, run comparison | |
 | 5 | Tracing SDK, ingest API, nested spans | |
 | 6 | Observability dashboard | |
@@ -244,3 +284,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0002 — Arq over Celery](docs/adr/0002-task-queue.md)
 - [ADR 0003 — TimescaleDB for spans](docs/adr/0003-trace-storage.md)
 - [ADR 0004 — Immutable prompt versions, movable labels](docs/adr/0004-prompt-versioning-model.md)
+- [ADR 0005 — Eval engine: execution, evaluators, providers](docs/adr/0005-eval-engine.md)

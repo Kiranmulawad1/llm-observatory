@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "FastAPI control plane and trace ingestion API"
 requires-python = ">=3.13"
 dependencies = [
+    # Required by FastAPI for the multipart dataset-upload endpoint.
+    "python-multipart>=0.0.20",
     "lo-core",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",

@@ -18,6 +18,7 @@ from arq.connections import RedisSettings
 from lo_core.config import get_settings
 from lo_core.db import dispose_engine
 from lo_core.logging import configure_logging, get_logger
+from lo_worker.tasks.evaluation import run_eval
 
 log = get_logger(__name__)
 
@@ -41,7 +42,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    functions = [ping]
+    functions = [ping, run_eval]
     on_startup = startup
     on_shutdown = shutdown
 

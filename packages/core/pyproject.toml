@@ -12,7 +12,21 @@ dependencies = [
     "jinja2>=3.1.5",
     "redis>=5.2",
     "structlog>=24.4",
+    # `regex`, not stdlib `re`: evaluator patterns are supplied by API callers,
+    # and stdlib re has no way to bound backtracking. See evaluators/deterministic.py.
+    "regex>=2024.11",
+    "jsonschema>=4.23",
+    "httpx>=0.28",
+    # Official SDK rather than raw HTTP: it owns retry/backoff, streaming and
+    # typed errors, and it is a thin dependency (httpx + pydantic, both already
+    # present here).
+    "anthropic>=0.69",
 ]
+
+[project.optional-dependencies]
+# Local embedding inference, needed only by the worker. Kept optional so the API
+# image does not carry onnxruntime and a model file it never loads.
+local-embeddings = ["fastembed>=0.5"]
 
 [build-system]
 requires = ["hatchling"]

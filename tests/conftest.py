@@ -8,6 +8,7 @@ developer's shell or the CI runner's environment.
 from __future__ import annotations
 
 import os
+import uuid
 from collections.abc import AsyncIterator, Iterator
 
 import httpx
@@ -109,6 +110,56 @@ async def session(db_connection: AsyncConnection) -> AsyncIterator[AsyncSession]
     )
     async with maker() as db_session:
         yield db_session
+
+
+@pytest.fixture
+async def committed_project() -> AsyncIterator[uuid.UUID]:
+    """A project whose rows are really committed, cleaned up afterwards.
+
+    The rolled-back-transaction fixtures above cannot be used for runner tests:
+    the runner opens its own sessions per concurrent example (it must — a
+    SQLAlchemy session is not safe for concurrent use), so it would never see
+    data sitting uncommitted in the test's transaction.
+
+    So these tests commit for real and clean up by deleting the project, which
+    cascades to prompts, datasets, versions, runs, results and scores. The
+    tenancy FK doing the cleanup is a nice side-effect of getting it right.
+    """
+    from lo_core.db import dispose_engine, session_scope
+    from lo_core.db.models.project import Project
+    from lo_core.schemas.prompt import ProjectCreate
+    from lo_core.services import projects as project_service
+
+    slug = f"runner-{uuid.uuid4().hex[:10]}"
+    async with session_scope() as session:
+        project = await project_service.create_project(
+            session, ProjectCreate(slug=slug, name="Runner test project")
+        )
+        project_id = project.id
+
+    try:
+        yield project_id
+    finally:
+        from sqlalchemy import delete
+
+        from lo_core.db.models.evaluation import EvalRun
+
+        async with session_scope() as session:
+            # Eval runs must go first. `eval_runs.prompt_version_id` and
+            # `.dataset_version_id` are RESTRICT — deliberately, so a run can
+            # never be left pointing at a version that no longer exists — and
+            # deleting the project would otherwise cascade into those versions
+            # and hit the constraint.
+            #
+            # Bulk DELETE rather than ORM deletes: every relationship here is
+            # `lazy="raise"`, so letting the ORM walk the graph to cascade would
+            # raise instead of loading. Postgres applies the ON DELETE rules.
+            await session.execute(delete(EvalRun).where(EvalRun.project_id == project_id))
+            await session.execute(delete(Project).where(Project.id == project_id))
+
+        # The runner's engine is the module-global one; dispose it so the next
+        # test's event loop does not inherit connections bound to this one.
+        await dispose_engine()
 
 
 @pytest.fixture

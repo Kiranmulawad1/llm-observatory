@@ -28,6 +28,10 @@ dev = [
     "testcontainers[postgres,redis]>=4.9",
     "ruff>=0.9",
     "mypy>=1.14",
+    # Stub packages, so `mypy --strict` type-checks our *use* of these libraries
+    # rather than treating every call as Any.
+    "types-jsonschema>=4.23",
+    "types-regex>=2024.11",
 ]
 
 [tool.uv.sources.lo-api]
@@ -93,7 +97,9 @@ mypy_path = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["testcontainers.*", "arq.*"]
+# `fastembed` is an optional extra that only the worker installs, so it is
+# legitimately absent when type-checking the API or the SDK.
+module = ["testcontainers.*", "arq.*", "fastembed.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
