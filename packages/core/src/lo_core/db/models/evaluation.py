@@ -97,6 +97,21 @@ class EvalRun(UUIDPrimaryKey, TimestampMixin, ControlBase):
         index=True,
     )
 
+    # The judge rubric version that scored this run, when an LLM-as-judge
+    # evaluator was used. Null otherwise.
+    #
+    # This is the field that makes judged scores auditable. A judge is itself a
+    # prompt, and editing a rubric changes every score it produces — so without
+    # pinning the exact version, "faithfulness dropped from 0.8 to 0.6" is
+    # unattributable between a worse model and a stricter rubric. RESTRICT for
+    # the same reason as the other two: a run pointing at a vanished version is
+    # a result nobody can interpret.
+    judge_prompt_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{CONTROL_SCHEMA}.prompt_versions.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")
 
     # The evaluator specs as requested, stored verbatim. Reproducing a run means

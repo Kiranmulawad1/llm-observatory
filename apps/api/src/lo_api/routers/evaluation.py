@@ -11,12 +11,18 @@ from lo_api.dependencies import CurrentProject, DbSession
 from lo_api.queue import enqueue
 from lo_core.evaluators.registry import EvaluatorInfo, available
 from lo_core.schemas.evaluation import (
+    Alignment,
     DeadLetterRead,
     EvalRunCreate,
     EvalRunDetail,
     EvalRunRead,
+    RunComparison,
 )
+from lo_core.schemas.prompt import PromptRead
 from lo_core.services import evaluation as service
+from lo_core.services import judges as judge_service
+from lo_core.services import prompts as prompt_service
+from lo_core.services.comparison import DEFAULT_EPSILON, compare_runs
 
 router = APIRouter(tags=["evaluation"])
 
@@ -112,6 +118,59 @@ async def cancel_run(
 ) -> EvalRunRead:
     run = await service.get_run(session, project.id, run_id)
     return service.to_read(await service.cancel_run(session, run))
+
+
+@router.get(
+    "/projects/{project_slug}/eval/compare",
+    response_model=RunComparison,
+    summary="Compare two eval runs",
+)
+async def compare(
+    project: CurrentProject,
+    session: DbSession,
+    baseline: Annotated[uuid.UUID, Query(description="The run to compare against")],
+    candidate: Annotated[uuid.UUID, Query(description="The run being evaluated")],
+    align: Annotated[Alignment, Query()] = "identity",
+    epsilon: Annotated[float, Query(ge=0.0, le=1.0)] = DEFAULT_EPSILON,
+) -> RunComparison:
+    """Did this change make things worse?
+
+    Defaults to identity alignment, which requires both runs to use the same
+    dataset version and returns 409 otherwise. `align=positional` is the explicit
+    opt-out for comparing across dataset versions; it matches by index and
+    attaches a warning, because an inserted row shifts every subsequent index and
+    would otherwise produce confident nonsense.
+    """
+    before = await service.get_run(session, project.id, baseline)
+    after = await service.get_run(session, project.id, candidate)
+    return await compare_runs(session, before, after, align=align, epsilon=epsilon)
+
+
+@router.post(
+    "/projects/{project_slug}/judges/seed",
+    response_model=list[PromptRead],
+    status_code=status.HTTP_201_CREATED,
+    summary="Install the built-in judge rubrics into this project",
+)
+async def seed_judges(project: CurrentProject, session: DbSession) -> list[PromptRead]:
+    """Seed correctness / faithfulness / relevance / toxicity rubrics.
+
+    Idempotent by slug: a rubric the team has already edited is left untouched,
+    because overwriting it would silently change the meaning of every score it
+    subsequently produces.
+    """
+    created = await judge_service.seed_builtin_rubrics(session, project.id)
+    return [await prompt_service.build_prompt_read(session, p) for p in created]
+
+
+@router.get(
+    "/projects/{project_slug}/judges",
+    response_model=list[PromptRead],
+    summary="List this project's judge rubrics",
+)
+async def list_judges(project: CurrentProject, session: DbSession) -> list[PromptRead]:
+    judges = await judge_service.list_judges(session, project.id)
+    return [await prompt_service.build_prompt_read(session, p) for p in judges]
 
 
 @router.get(

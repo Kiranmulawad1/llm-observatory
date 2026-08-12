@@ -102,6 +102,14 @@ class AnthropicProvider(GenerationProvider):
         if system_parts:
             kwargs["system"] = "\n\n".join(system_parts)
 
+        if request.response_schema is not None:
+            # Structured outputs. The API constrains generation to the schema,
+            # so the judge's response is valid JSON by construction rather than
+            # by hope — see GenerationRequest.response_schema.
+            kwargs["output_config"] = {
+                "format": {"type": "json_schema", "schema": request.response_schema}
+            }
+
         started = time.perf_counter()
         try:
             message = await self._client.messages.create(

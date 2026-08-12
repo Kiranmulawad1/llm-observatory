@@ -37,6 +37,7 @@ from lo_core.schemas.evaluation import (
     EvaluatorAggregate,
 )
 from lo_core.services import datasets as dataset_service
+from lo_core.services import judges as judge_service
 from lo_core.services import prompts as prompt_service
 
 
@@ -98,10 +99,29 @@ async def create_run(
 
         validate_request(model, parameters)
 
+    # Resolve the judge rubric now, so a run pins the exact rubric version that
+    # scored it. Without this pin a score change is unattributable between the
+    # model under test and an edited rubric.
+    # At most one, because `build_all` above already rejects a duplicated
+    # evaluator name — scores are unique per (result, evaluator), so two judges
+    # in one run would collide on insert. Comparing two rubrics means two runs.
+    judge_version = None
+    judge_specs = [s for s in payload.evaluators if s.type == "llm_judge"]
+    if judge_specs:
+        config = judge_specs[0].config
+        rubric_slug = config.get("rubric")
+        if not isinstance(rubric_slug, str):
+            raise ValidationError("llm_judge requires a 'rubric' slug in its config")
+
+        judge_version = await judge_service.resolve_rubric(
+            session, project_id, rubric_slug, config.get("rubric_version")
+        )
+
     run = EvalRun(
         project_id=project_id,
         dataset_version_id=dataset_version.id,
         prompt_version_id=prompt_version.id if prompt_version else None,
+        judge_prompt_version_id=judge_version.id if judge_version else None,
         status="pending",
         evaluators=[spec.model_dump() for spec in payload.evaluators],
         provider_config={
@@ -111,6 +131,7 @@ async def create_run(
             "max_tokens": payload.max_tokens,
             "concurrency": payload.concurrency,
             "parameters": parameters,
+            "judge_model": payload.judge_model,
         },
         commit_sha=payload.commit_sha,
         triggered_by=payload.triggered_by,

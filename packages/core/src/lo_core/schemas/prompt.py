@@ -19,6 +19,9 @@ from lo_core.db.models.prompt import LABEL_PATTERN, SLUG_PATTERN
 
 Role = Literal["system", "user", "assistant"]
 
+# See PROMPT_KINDS in db/models/prompt.py for why judges share this table.
+PromptKind = Literal["application", "judge"]
+
 Slug = Annotated[str, StringConstraints(pattern=SLUG_PATTERN, min_length=1, max_length=64)]
 Label = Annotated[str, StringConstraints(pattern=LABEL_PATTERN, min_length=1, max_length=32)]
 
@@ -93,6 +96,7 @@ class PromptCreate(BaseModel):
     slug: Slug
     name: str = Field(min_length=1, max_length=200)
     description: str | None = None
+    kind: PromptKind = "application"
 
 
 class PromptUpdate(BaseModel):
@@ -148,6 +152,7 @@ class PromptRead(BaseModel):
     slug: str
     name: str
     description: str | None
+    kind: PromptKind
     created_at: datetime
     updated_at: datetime
     latest_version: int | None = None

@@ -38,6 +38,15 @@ class GenerationRequest:
     # explicit rather than silent.
     parameters: dict[str, Any] = field(default_factory=dict)
 
+    # A JSON Schema the response must conform to, when set.
+    #
+    # This exists for the judge. Asking a model to "rate 1-5 and explain" and
+    # then regex-ing a number out of the prose is how judge evals rot silently:
+    # the model rephrases, the pattern stops matching, and every example scores
+    # null while the run still reports success. Constraining the response
+    # server-side makes a parse failure impossible rather than merely unlikely.
+    response_schema: dict[str, Any] | None = None
+
 
 @dataclass(frozen=True)
 class GenerationResponse:

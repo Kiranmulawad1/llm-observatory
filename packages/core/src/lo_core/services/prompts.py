@@ -50,6 +50,7 @@ async def create_prompt(
         slug=payload.slug,
         name=payload.name,
         description=payload.description,
+        kind=payload.kind,
     )
     session.add(prompt)
     try:
@@ -350,6 +351,7 @@ async def list_prompt_reads(
             slug=p.slug,
             name=p.name,
             description=p.description,
+            kind=p.kind,
             created_at=p.created_at,
             updated_at=p.updated_at,
             latest_version=latest.get(p.id),
@@ -369,6 +371,7 @@ async def build_prompt_read(session: AsyncSession, prompt: Prompt) -> PromptRead
         slug=prompt.slug,
         name=prompt.name,
         description=prompt.description,
+        kind=prompt.kind,
         created_at=prompt.created_at,
         updated_at=prompt.updated_at,
         latest_version=latest,

@@ -39,6 +39,7 @@ from lo_core.db.models.dataset import DatasetItem
 from lo_core.db.models.evaluation import DeadLetterJob, EvalResult, EvalRun, EvalScore
 from lo_core.db.models.prompt import PromptVersion
 from lo_core.evaluators.base import EvaluationSample, Evaluator, UnscoreableError
+from lo_core.evaluators.judge import JudgeEvaluator
 from lo_core.evaluators.registry import EvaluatorSpec, build_all
 from lo_core.evaluators.similarity import EmbeddingSimilarityEvaluator
 from lo_core.logging import get_logger
@@ -79,8 +80,28 @@ async def execute_run(run_id: uuid.UUID) -> str:
         dataset_version_id = run.dataset_version_id
         prompt_version_id = run.prompt_version_id
 
+        # Loaded here, inside the same session, because the judge evaluator has
+        # no database access of its own — it is handed a resolved template.
+        judge_template: list[Message] | None = None
+        if run.judge_prompt_version_id is not None:
+            judge_version = await session.get(PromptVersion, run.judge_prompt_version_id)
+            if judge_version is None:
+                raise RuntimeError(f"judge version {run.judge_prompt_version_id} not found")
+            judge_template = [Message.model_validate(m) for m in judge_version.messages]
+
     generation = get_generation_provider(config["generation_provider"])
     evaluators = build_all(specs)
+
+    for evaluator in evaluators:
+        if isinstance(evaluator, JudgeEvaluator):
+            if judge_template is None:  # pragma: no cover - create_run pins it
+                raise RuntimeError("run has an llm_judge evaluator but no pinned rubric version")
+            evaluator.bind(
+                provider=generation,
+                template=judge_template,
+                model=config.get("judge_model") or config["model"],
+                target_model=config["model"],
+            )
 
     # Only construct the embedder if something actually needs it — building the
     # local one loads an ONNX model, which is seconds of latency and hundreds of

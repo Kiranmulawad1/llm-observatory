@@ -226,6 +226,43 @@ curl -s localhost:8000/dead-letters
 the whole flow above runs offline. Set `LO_ANTHROPIC_API_KEY` and pass
 `"generation_provider":"anthropic"` to evaluate against a real model.
 
+### Judging and comparing runs
+
+```bash
+# Install the built-in rubrics as versioned judge prompts in this project.
+# Idempotent: a rubric you have already edited is never overwritten.
+curl -X POST localhost:8000/projects/demo/judges/seed | jq '.[].slug'
+# judge-correctness  judge-faithfulness  judge-relevance  judge-toxicity
+
+# A rubric is an ordinary prompt — diff it, version it, promote it
+curl -s localhost:8000/projects/demo/prompts/judge-faithfulness/versions | jq '.[0].version'
+
+# Run with a judge and retrieval metrics together
+curl -X POST localhost:8000/projects/demo/eval/runs \
+  -H 'content-type: application/json' \
+  -d '{"dataset":"support-qa","prompt":"support-triage","prompt_version":"production",
+       "evaluators":[
+         {"type":"llm_judge","config":{"rubric":"judge-correctness"}},
+         {"type":"retrieval_recall","config":{"k":5}},
+         {"type":"retrieval_mrr"}],
+       "generation_provider":"fake","judge_model":"claude-opus-5"}'
+
+# Did this change make things worse?
+curl -s 'localhost:8000/projects/demo/eval/compare?baseline=<run-a>&candidate=<run-b>' \
+  | jq '{regressed: .regressed_count, improved: .improved_count,
+         warnings, evaluators: [.evaluators[] | {evaluator, delta, change}]}'
+```
+
+Comparison aligns examples by dataset item id and **refuses** if the two runs
+used different dataset versions — pass `align=positional` to compare by index
+anyway, and the response carries a warning explaining why that is weaker. Runs
+that differed in model, prompt version or judge rubric are flagged too, since a
+score delta means something different depending on which one moved.
+
+Retrieval metrics read the retrieved passages from a dataset field
+(`retrieved_context` by default) and compare them against `expected_context`.
+They need no model call, so they are cheap enough to gate every commit on.
+
 ### Migrations
 
 ```bash
@@ -270,7 +307,7 @@ These are the rules the codebase actually enforces, not aspirations:
 | 1 | Scaffolding, workspace, docker-compose, health, CI | ✅ Done |
 | 2 | Prompt registry + versioning + diffs (API) | ✅ Done |
 | 3 | Eval engine: datasets, evaluator plugins, async runner | ✅ Done |
-| 4 | LLM-as-judge, retrieval metrics, run comparison | |
+| 4 | LLM-as-judge, retrieval metrics, run comparison | ✅ Done |
 | 5 | Tracing SDK, ingest API, nested spans | |
 | 6 | Observability dashboard | |
 | 7 | Guardrail sampling, review queue, labelling flywheel | |
@@ -285,3 +322,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0003 — TimescaleDB for spans](docs/adr/0003-trace-storage.md)
 - [ADR 0004 — Immutable prompt versions, movable labels](docs/adr/0004-prompt-versioning-model.md)
 - [ADR 0005 — Eval engine: execution, evaluators, providers](docs/adr/0005-eval-engine.md)
+- [ADR 0006 — Judges as prompts, retrieval metrics, comparison](docs/adr/0006-judge-retrieval-comparison.md)

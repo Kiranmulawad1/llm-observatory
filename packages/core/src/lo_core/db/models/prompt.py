@@ -54,6 +54,22 @@ if TYPE_CHECKING:
 LABEL_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,31}$"
 SLUG_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
 
+# What a prompt is *for*.
+#
+#   application  the prompt under test — what your product sends to a model
+#   judge        a scoring rubric an LLM-as-judge evaluator renders
+#
+# Judges live in this same table rather than a parallel one because a judge
+# prompt needs exactly what an application prompt needs: immutable versions,
+# movable labels, diffs, and server-side rendering. Duplicating ADR 0004's
+# machinery for a second entity would mean a second version numbering scheme and
+# a second diff implementation to keep in step.
+#
+# The discriminator is what keeps them from being confused for one another: the
+# UI lists them separately, and an eval run validates that its judge reference
+# actually points at a judge.
+PROMPT_KINDS: tuple[str, ...] = ("application", "judge")
+
 
 class Prompt(UUIDPrimaryKey, TimestampMixin, ControlBase):
     """The stable identity. Holds no content of its own."""
@@ -64,6 +80,7 @@ class Prompt(UUIDPrimaryKey, TimestampMixin, ControlBase):
         # able to own a prompt called "summarize" without coordinating names.
         UniqueConstraint("project_id", "slug", name="uq_prompts_project_id_slug"),
         CheckConstraint(f"slug ~ '{SLUG_PATTERN}'", name="slug_format"),
+        CheckConstraint("kind IN " + str(PROMPT_KINDS), name="kind_valid"),
         {"schema": CONTROL_SCHEMA},
     )
 
@@ -75,6 +92,12 @@ class Prompt(UUIDPrimaryKey, TimestampMixin, ControlBase):
     slug: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Defaulted server-side so the migration backfills every existing row as an
+    # application prompt without a data migration step.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="application", index=True
+    )
 
     project: Mapped[Project] = relationship(back_populates="prompts", lazy="raise")
     versions: Mapped[list[PromptVersion]] = relationship(

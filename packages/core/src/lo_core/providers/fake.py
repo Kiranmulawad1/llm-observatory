@@ -14,9 +14,11 @@ same output and a test can assert on exact values.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections.abc import Sequence
+from typing import Any
 
 from lo_core.providers.base import (
     EmbeddingProvider,
@@ -59,7 +61,11 @@ class FakeGenerationProvider(GenerationProvider):
             joined,
         )
         digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:8]
-        text = f"{last_user.strip()} [fake:{digest}]"
+
+        if request.response_schema is not None:
+            text = self._structured(request.response_schema, joined)
+        else:
+            text = f"{last_user.strip()} [fake:{digest}]"
 
         # Rough but stable token estimate. Not accurate against any real
         # tokenizer, and not meant to be — its job is to make the cost and token
@@ -76,6 +82,38 @@ class FakeGenerationProvider(GenerationProvider):
             cost_usd=compute_cost(request.model, input_tokens, output_tokens),
             metadata={"provider": "fake"},
         )
+
+    @staticmethod
+    def _structured(schema: dict[str, Any], seed_text: str) -> str:
+        """Emit deterministic JSON conforming to `schema`.
+
+        Only handles the shallow object-of-scalars shape the judge uses — this
+        is a test double, not a schema-driven data generator, and pretending
+        otherwise would be a lot of code nobody exercises.
+
+        Values are derived from a hash of the prompt so a judge test gets a
+        stable score it can assert on, while different inputs still produce
+        different scores.
+        """
+        digest = hashlib.sha256(seed_text.encode("utf-8")).digest()
+        properties: dict[str, Any] = schema.get("properties", {})
+        payload: dict[str, Any] = {}
+
+        for offset, (key, spec) in enumerate(properties.items()):
+            kind = spec.get("type")
+            if kind == "integer":
+                low = int(spec.get("minimum", 0))
+                high = int(spec.get("maximum", low + 4))
+                span = max(1, high - low + 1)
+                payload[key] = low + (digest[offset % len(digest)] % span)
+            elif kind == "number":
+                payload[key] = round((digest[offset % len(digest)] % 101) / 100, 2)
+            elif kind == "boolean":
+                payload[key] = digest[offset % len(digest)] % 2 == 0
+            else:
+                payload[key] = f"fake {key} for {digest[:4].hex()}"
+
+        return json.dumps(payload)
 
 
 class FakeEmbeddingProvider(EmbeddingProvider):

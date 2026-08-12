@@ -16,6 +16,7 @@ from lo_core.evaluators.deterministic import (
     JSONSchemaEvaluator,
     RegexMatchEvaluator,
 )
+from lo_core.evaluators.judge import JudgeEvaluator
 from lo_core.evaluators.registry import (
     EvaluatorInfo,
     EvaluatorSpec,
@@ -24,6 +25,11 @@ from lo_core.evaluators.registry import (
     build_all,
     get,
     register,
+)
+from lo_core.evaluators.retrieval import (
+    MRREvaluator,
+    PrecisionAtKEvaluator,
+    RecallAtKEvaluator,
 )
 from lo_core.evaluators.similarity import EmbeddingSimilarityEvaluator
 
@@ -36,6 +42,10 @@ __all__ = [
     "EvaluatorSpec",
     "ExactMatchEvaluator",
     "JSONSchemaEvaluator",
+    "JudgeEvaluator",
+    "MRREvaluator",
+    "PrecisionAtKEvaluator",
+    "RecallAtKEvaluator",
     "RegexMatchEvaluator",
     "UnscoreableError",
     "available",

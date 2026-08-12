@@ -120,6 +120,15 @@ class EvalRunCreate(BaseModel):
     max_tokens: int = Field(default=4096, gt=0, le=128_000)
     embedding_provider: str = "fake"
 
+    # The judge runs through the same provider as generation, but on its own
+    # model: judging is a different task from the one under test, and pinning it
+    # separately is what lets you evaluate a cheap model with a strong judge.
+    #
+    # Defaults to the strongest tier. A judge is the thing deciding whether a
+    # change ships, so its accuracy is worth more than its cost — and a judge
+    # that is weaker than the model it grades produces scores nobody trusts.
+    judge_model: str = "claude-opus-5"
+
     # Bounds in-flight provider calls for this run. Capped because it is the
     # main way one run can exhaust a provider rate limit and degrade every other
     # run sharing the worker.
@@ -216,3 +225,61 @@ class DeadLetterRead(BaseModel):
 
 
 ComparisonChange = Literal["improved", "regressed", "unchanged", "added", "removed"]
+Alignment = Literal["identity", "positional"]
+
+
+class RunSummary(BaseModel):
+    """The identity of a run, for the header of a comparison.
+
+    Carries every pinned version, because a score delta is only interpretable
+    against what actually differed between the two runs.
+    """
+
+    id: uuid.UUID
+    status: RunStatus
+    label: str | None
+    commit_sha: str | None
+    dataset_version_id: uuid.UUID
+    prompt_version_id: uuid.UUID | None
+    judge_prompt_version_id: uuid.UUID | None
+    model: str | None
+    total_items: int
+    completed_items: int
+    failed_items: int
+    created_at: datetime
+
+
+class EvaluatorDelta(BaseModel):
+    evaluator: str
+    baseline_mean: float | None
+    candidate_mean: float | None
+    delta: float | None
+    change: ComparisonChange
+    baseline_pass_rate: float | None = None
+    candidate_pass_rate: float | None = None
+
+
+class ExampleComparison(BaseModel):
+    item_index: int
+    dataset_item_id: uuid.UUID
+    change: ComparisonChange
+    baseline_output: str | None
+    candidate_output: str | None
+    baseline_scores: dict[str, float | None] = Field(default_factory=dict)
+    candidate_scores: dict[str, float | None] = Field(default_factory=dict)
+    score_deltas: dict[str, float | None] = Field(default_factory=dict)
+    evaluator_changes: dict[str, ComparisonChange] = Field(default_factory=dict)
+
+
+class RunComparison(BaseModel):
+    baseline: RunSummary
+    candidate: RunSummary
+    alignment: Alignment
+    # Everything that differed between the runs besides the scores themselves.
+    # Surfaced rather than buried: a rubric change and a model change produce
+    # identical-looking score movement.
+    warnings: list[str] = Field(default_factory=list)
+    evaluators: list[EvaluatorDelta] = Field(default_factory=list)
+    examples: list[ExampleComparison] = Field(default_factory=list)
+    regressed_count: int = 0
+    improved_count: int = 0
