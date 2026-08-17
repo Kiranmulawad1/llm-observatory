@@ -342,6 +342,46 @@ prove the alert came from you.
 `trace_count below N` doubles as a heartbeat — it catches a pipeline that stopped
 sending, which no threshold-above rule would ever see.
 
+### The data flywheel
+
+Turn production failures into eval examples:
+
+```bash
+# 1. Enable sampling. 10% of traffic, plus 5% of clean traces as a control.
+curl -X PUT localhost:8000/projects/demo/guardrails \
+  -H 'content-type: application/json' \
+  -d '{"enabled":true,"sample_rate":0.1,"control_sample_rate":0.05}'
+
+# 2. Send traffic. The worker samples every five minutes and runs three
+#    checks — PII regex, a grounding heuristic, and a toxicity wordlist.
+
+# 3. Look at what got flagged, worst first.
+curl -s localhost:8000/projects/demo/review | jq '.[] | {output, findings}'
+
+# 4. Label it, supplying the answer it should have given.
+curl -X POST localhost:8000/projects/demo/review/<id>/label \
+  -H 'content-type: application/json' \
+  -d '{"verdict":"bad","reason":"hallucinated_price",
+       "corrected_output":"I do not have pricing for that item."}'
+
+# 5. Promote a batch into a dataset. One promotion, one new version.
+curl -X POST localhost:8000/projects/demo/review/promote \
+  -H 'content-type: application/json' \
+  -d '{"item_ids":["<id>"],"dataset":"qa"}'
+```
+
+The example is now an ordinary eval case, carrying provenance in its metadata —
+which trace it came from, who labelled it, and why. The next prompt change is
+tested against the failure that produced it.
+
+**The control sample is the part worth understanding.** Reviewing only flagged
+traces means you only ever see failures your checks already know how to find. A
+slice of *clean* traffic goes to the queue too, and `estimated_miss_rate` — the
+share of those a human judged bad — is the false-negative rate of your
+heuristics. Almost no guardrail system reports that about itself.
+
+Or do all of it in the dashboard at `/demo/review`.
+
 ### Migrations
 
 ```bash
@@ -389,7 +429,7 @@ These are the rules the codebase actually enforces, not aspirations:
 | 4 | LLM-as-judge, retrieval metrics, run comparison | ✅ Done |
 | 5 | Tracing SDK, ingest API, nested spans | ✅ Done |
 | 6 | Observability dashboard + alerting | ✅ Done |
-| 7 | Guardrail sampling, review queue, labelling flywheel | |
+| 7 | Guardrail sampling, review queue, labelling flywheel | ✅ Done |
 | 8 | API keys per project, auth across all endpoints | partial (ingest done) |
 | 9 | Kubernetes manifests, Terraform for GCP | |
 | 10 | CD with plan → manual approval → apply | |
@@ -404,3 +444,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0006 — Judges as prompts, retrieval metrics, comparison](docs/adr/0006-judge-retrieval-comparison.md)
 - [ADR 0007 — Tracing: spans, ingestion, the SDK contract](docs/adr/0007-tracing-and-ingestion.md)
 - [ADR 0008 — Dashboard metrics, the BFF, and alerting](docs/adr/0008-dashboard-and-alerting.md)
+- [ADR 0009 — Guardrail sampling and the data flywheel](docs/adr/0009-guardrails-and-the-flywheel.md)

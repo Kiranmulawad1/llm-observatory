@@ -17,6 +17,7 @@ from lo_core.db.models.evaluation import (
 )
 from lo_core.db.models.project import Project
 from lo_core.db.models.prompt import Prompt, PromptLabel, PromptVersion
+from lo_core.db.models.review import GuardrailConfig, ReviewItem
 from lo_core.db.models.telemetry import Span, Trace
 
 __all__ = [
@@ -29,10 +30,12 @@ __all__ = [
     "EvalResult",
     "EvalRun",
     "EvalScore",
+    "GuardrailConfig",
     "Project",
     "Prompt",
     "PromptLabel",
     "PromptVersion",
+    "ReviewItem",
     "Span",
     "Trace",
 ]

@@ -19,6 +19,7 @@ from lo_api.routers import (
     metrics,
     projects,
     prompts,
+    review,
     traces,
 )
 from lo_core.config import get_settings
@@ -83,6 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(api_keys.router)
     app.include_router(traces.router)
     app.include_router(metrics.router)
+    app.include_router(review.router)
 
     return app
 

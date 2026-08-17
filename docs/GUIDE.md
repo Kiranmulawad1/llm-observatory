@@ -910,8 +910,8 @@ The trap is describing *features*. Describe **decisions and their consequences**
 | 4 | Judge, retrieval metrics, run comparison | ✅ |
 | 5 | Tracing SDK, ingest API, nested spans | ✅ |
 | 6 | Observability dashboard (Next.js) + alerting | ✅ |
-| 7 | Guardrail sampling, review queue, flywheel | next |
-| 8 | API keys per project, auth everywhere | partial (ingest done) |
+| 7 | Guardrail sampling, review queue, flywheel | ✅ |
+| 8 | API keys per project, auth everywhere | next (ingest already done) |
 | 9 | Kubernetes manifests, Terraform for GCP | |
 | 10 | CI/CD with plan → approve → apply | |
 
@@ -1544,7 +1544,294 @@ Once a minute, in the worker, off the request path entirely.
 
 ---
 
-## 12. Where to look when you're stuck
+## 12. Phase 7 — the data flywheel, explained
+
+This is the phase your brief singled out: *"this is the data flywheel pattern
+real companies use — implement it, don't just describe it."*
+
+### 12.1 What the flywheel actually is
+
+Here's the problem it solves. Your eval set contains whatever someone thought to
+write down on day one. Production contains failures nobody imagined. Without a
+path between them, the same bug ships twice.
+
+```
+production traffic
+    ↓  sampled (10%)
+cheap checks run
+    ↓  flagged
+review queue
+    ↓  a human labels it + writes the correct answer
+eval dataset (new version)
+    ↓
+the next prompt change is tested against it
+```
+
+Every arrow is a function in `services/review.py`. That's the whole phase.
+
+### 12.2 Why sampling is deterministic, not random
+
+The obvious implementation is `if random.random() < 0.1`. I used a hash instead:
+
+```python
+def sample_bucket(trace_id: str) -> float:
+    digest = hashlib.sha256(trace_id.encode()).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+```
+
+Two things this buys:
+
+**No coordination between workers.** Run three sampler processes and they all
+agree on whether a given trace is in the sample, without talking to each other.
+With `random()` they'd each roll their own dice.
+
+**"Why wasn't this trace checked?" becomes answerable.** You recompute the hash
+and get a definite answer. With randomness the answer is a shrug — which is a
+bad thing to say to someone investigating an incident.
+
+One exception, hardcoded: **errored traces are always sampled.** Sampling away
+your failures to hit a quota would be exactly backwards.
+
+### 12.3 The three checks, and why the second one is clever
+
+None of them call a model. That's the constraint — they run continuously over
+production traffic.
+
+**PII — regex, and the work is in avoiding false positives.**
+
+A naive credit-card regex matches every 16-digit order number. So matches get a
+Luhn checksum:
+
+```python
+def luhn_valid(digits: str) -> bool: ...
+```
+
+That's the algorithm every real card number satisfies. Without it the check fires
+constantly, people mute it, and you've built nothing.
+
+Two more details worth noting:
+- **Only the output is scanned.** A user's email in the *input* is them telling
+  you their address. The same email in the *output* means the model repeated
+  someone's data back — that's the leak.
+- **Matches are redacted before storage.** Writing the raw value into a review
+  item would move the leak from a transient trace (90-day retention) into the
+  control plane (forever).
+
+**Grounding — the hallucination heuristic, and this is the interesting one.**
+
+How do you detect a hallucination without ground truth? You mostly can't — for
+prose claims you'd need a judge. But you *can* detect a fabricated **number**:
+
+```python
+for match in NUMBER_PATTERN.findall(output):
+    if cleaned not in context_text:
+        unsupported.append(match)
+```
+
+A price, a date, a percentage, a count — if it appears in the answer and nowhere
+in the retrieved documents, the model made it up. That's the most damaging kind
+of hallucination and detecting it is a string search.
+
+Three refinements that make it usable:
+- Separators normalised, so `1,000` in the answer matches `1000` in the source.
+- Common small numbers ignored — "there are 3 steps" is not evidence of anything.
+- **Returns nothing when there's no context.** The check is meaningless for a
+  non-RAG trace, and flagging every one of them would drown the queue.
+
+**Toxicity — a wordlist, and the docstring says so plainly.**
+
+It catches slurs and overt abuse. It cannot detect condescension, dismissiveness,
+or a technically-polite refusal that reads as contempt. It exists because it's
+free. Judge escalation is the answer when a project needs better — which is
+exactly what the opt-in setting is for.
+
+**Severity is ordered across checks:**
+
+| Finding | Severity |
+| --- | --- |
+| Leaked API key | 1.0 |
+| Credit card / SSN | 0.9 |
+| Ungrounded numbers | up to 0.8 |
+| Email / phone | 0.4 |
+
+A leaked credential is an incident. An ungrounded number is a quality problem.
+The queue is ordered worst-first, so that distinction decides what a human sees
+at 9am.
+
+### 12.4 The control sample — the idea most worth stealing
+
+This is the design decision I'd lead with in an interview.
+
+If you only review traces your checks flagged, **you only ever see failures your
+checks already know how to find.** A blind spot is invisible by construction. You
+could have a PII regex that misses a common email format and never find out.
+
+So a slice of *clean* traffic goes into the queue too, unflagged:
+
+```
+sampled 100 traces
+  ├─ 12 flagged      -> queue (with reasons)
+  └─ 88 clean
+       └─ 4 control  -> queue (no reasons)
+```
+
+Then:
+
+```
+estimated_miss_rate = control traces a human judged bad
+                      ─────────────────────────────────
+                      control traces reviewed
+```
+
+That's the **false-negative rate of your heuristics**, measured against real
+data. Almost no guardrail system reports that about itself. A rising number means
+the checks need work — and you find out *before* a customer does.
+
+(The control hash is salted differently — `control:{trace_id}` — so control
+selection isn't correlated with the sampling decision that came before it.)
+
+### 12.5 Why review items copy the trace instead of pointing at it
+
+A `ReviewItem` stores `inputs`, `output`, `context`, `model` — duplicating data
+that already exists in `telemetry.spans`. That looks like sloppy denormalisation.
+It isn't.
+
+**Telemetry is under a retention policy. Spans get dropped after 90 days.**
+
+A labelled example is worth *more* the older it gets — it's institutional memory
+about how your system fails. A review queue full of rows pointing at deleted
+traces would be worthless.
+
+So the item copies what it needs at sampling time. The `trace_id` is kept for
+linking back while the trace still exists, deliberately **without** a foreign key
+— telemetry may move to its own database instance (ADR 0003), where a
+cross-database FK couldn't exist.
+
+### 12.6 Why a "bad" verdict requires a correction
+
+```python
+if verdict == "bad" and not corrected:
+    return { error: "A 'bad' verdict needs the answer it should have given." };
+```
+
+Think about what happens without it. You label a trace "bad" and promote it. Now
+your dataset has an example with **no expected output**. Run `exact_match` against
+it and you get... nothing. It's unscoreable by exactly the evaluators you'd want
+to run.
+
+The correction is what makes the example useful. It's enforced twice — in the UI
+so the reviewer finds out while the context is still in their head, and in the
+service so the API can't be bypassed.
+
+A "good" verdict needs no correction, because it *is* the statement that the
+model's output was the right answer.
+
+### 12.7 Why promotion is batched
+
+Dataset versions are immutable (Phase 3). So:
+
+- Promote one item at a time → 50 labels becomes **50 dataset versions**.
+- Promote a batch → 50 labels becomes **one version**.
+
+The second is obviously right, and it's forced by the immutability decision made
+four phases earlier. That's what a coherent design feels like — an early
+constraint deciding a later API shape for you.
+
+The new version carries **every existing example plus the new ones**, because a
+version is a complete snapshot, not a delta. And each promoted example records
+where it came from:
+
+```json
+"metadata": {
+  "source": "review_queue",
+  "trace_id": "a1b2...",
+  "verdict": "bad",
+  "reason": "hallucinated_price",
+  "labeled_by": "kiran"
+}
+```
+
+Six months later, "where did this example come from?" has an answer.
+
+### 12.8 Seeing it work
+
+I ran this end to end. Five traces, two with planted failures:
+
+```
+=== the queue ===
+  [flagged] sev=0.60 grounding(0.60)  Yes, bulk orders over 50 units get 4999 dollars off.
+  [flagged] sev=0.40 pii(0.40)        Email returns-team@internal.example.com directly.
+```
+
+The grounding check caught `4999` — a number appearing nowhere in the retrieved
+context, which only said the Widget Pro costs 249 dollars. The PII check caught
+an internal address the model shouldn't have exposed. The three clean traces
+weren't queued.
+
+After labelling and promoting:
+
+```
+=== the eval examples that came out of production ===
+  Q: Any bulk discount?
+  A: I do not have bulk discount information for the Widget Pro.
+
+  Q: Who can I contact?
+  A: You can contact support through the returns page in your account.
+```
+
+Two production failures are now eval cases. Promoting the same item again
+returns **409** — it's already frozen into a dataset version.
+
+### 12.9 What's new in the file map
+
+| File | What it does |
+| --- | --- |
+| `guardrails.py` | The three checks + Luhn + the severity ordering |
+| `services/review.py` | Sampling, the queue, promotion — every arrow of the loop |
+| `db/models/review.py` | `guardrail_configs` + `review_items` (with the snapshot) |
+| `apps/api/routers/review.py` | Queue, labelling, promotion endpoints |
+| `apps/worker/tasks/sampling.py` | The five-minute cron |
+| `app/[project]/review/page.tsx` | The queue UI |
+| `app/[project]/review/actions.ts` | Server Actions (mutations don't go through the GET proxy) |
+| `components/review-queue.tsx` | Labelling form + batch promotion |
+
+### 12.10 More interview answers
+
+**"What's the data flywheel and did you build it?"**
+> Production surfaces failures the eval set doesn't contain. Sampling flags them
+> with cheap checks, a human labels them and writes what the answer should have
+> been, and promotion turns those into eval examples with provenance. It's a code
+> path, not a diagram — there's an integration test that walks the whole loop
+> from an ingested trace to a scoreable dataset item.
+
+**"How do you detect hallucinations without ground truth?"**
+> Cheaply, you don't — for prose claims you need a judge. But you can catch
+> fabricated *numbers*: a price or date in the answer that appears nowhere in the
+> retrieved context. It's a string search, it's the most damaging class of
+> hallucination, and it costs nothing. The judge stays available as an opt-in for
+> what the heuristic can't reach.
+
+**"How do you know your guardrails aren't missing things?"**
+> A control sample. A slice of traces the checks called *clean* goes to human
+> review anyway, and the fraction of those judged bad is the false-negative rate.
+> Without it you only ever review what your checks already catch, so a blind spot
+> stays invisible by construction.
+
+**"Why does the review item duplicate the trace data?"**
+> Because telemetry is under retention and gets dropped, while a labelled example
+> gets more valuable with age. The item snapshots what it needs so it outlives the
+> trace. There's no foreign key either — telemetry is designed to be movable to
+> its own instance, where one couldn't exist.
+
+**"Why is sampling deterministic?"**
+> No coordination needed between workers, and "why wasn't this trace sampled?"
+> has an answer you can recompute rather than a shrug about randomness. Errored
+> traces bypass the rate entirely — sampling away your failures to hit a quota is
+> backwards.
+
+---
+
+## 13. Where to look when you're stuck
 
 - **Why was this done this way?** → `docs/adr/` — one file per decision, each
   with the alternatives I rejected and why.

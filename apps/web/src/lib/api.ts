@@ -315,3 +315,61 @@ export type RunComparison = {
   regressed_count: number;
   improved_count: number;
 };
+
+export type Finding = {
+  check: string;
+  severity: number;
+  detail: Record<string, unknown>;
+};
+
+export type ReviewItem = {
+  id: string;
+  trace_id: string;
+  status: "pending" | "labeled" | "skipped";
+  sampled_as: "flagged" | "control";
+  findings: Finding[];
+  severity: number;
+  trace_name: string;
+  inputs: Record<string, unknown>;
+  output: string | null;
+  context: unknown[] | null;
+  model: string | null;
+  verdict: "good" | "bad" | null;
+  label_reason: string | null;
+  notes: string | null;
+  corrected_output: string | null;
+  labeled_by: string | null;
+  labeled_at: string | null;
+  promoted_at: string | null;
+  created_at: string;
+};
+
+export type ReviewStats = {
+  pending: number;
+  labeled: number;
+  skipped: number;
+  promoted: number;
+  control_reviewed: number;
+  control_missed: number;
+  /** Fraction of "clean" traces a human judged bad — the checks' false-negative rate. */
+  estimated_miss_rate: number | null;
+};
+
+export type GuardrailConfig = {
+  enabled: boolean;
+  sample_rate: number;
+  control_sample_rate: number;
+  check_pii: boolean;
+  check_grounding: boolean;
+  check_toxicity: boolean;
+  escalate_to_judge: boolean;
+  last_scanned_at: string | null;
+};
+
+export type Dataset = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  latest_version: number | null;
+};

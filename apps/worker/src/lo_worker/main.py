@@ -21,6 +21,7 @@ from lo_core.db import dispose_engine
 from lo_core.logging import configure_logging, get_logger
 from lo_worker.tasks.alerting import evaluate_alerts
 from lo_worker.tasks.evaluation import run_eval
+from lo_worker.tasks.sampling import sample_traces
 
 log = get_logger(__name__)
 
@@ -50,7 +51,18 @@ class WorkerSettings:
     # rules themselves are specified at (window_seconds is >= 60), so a tighter
     # schedule would re-answer an unchanged question; a looser one would delay
     # every alert by the difference.
-    cron_jobs = [cron(evaluate_alerts, second=0, run_at_startup=False)]
+    cron_jobs = [
+        cron(evaluate_alerts, second=0, run_at_startup=False),
+        # Every five minutes. Sampling is not time-critical — a human reviews
+        # the queue hours later — and a wider window means more useful work per
+        # wake-up.
+        cron(
+            sample_traces,
+            minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
+            second=30,
+            run_at_startup=False,
+        ),
+    ]
     on_startup = startup
     on_shutdown = shutdown
 
