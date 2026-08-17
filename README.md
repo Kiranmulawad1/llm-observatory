@@ -304,6 +304,44 @@ thread, drop-and-count on overflow, never raises into the caller, and completely
 inert when `LO_API_KEY` is unset. Point it at a dead endpoint and your code runs
 exactly as before — there is a test that asserts precisely that.
 
+### The dashboard
+
+```bash
+make web        # http://localhost:3000
+```
+
+Pick a project, then:
+
+| View | What it shows |
+| --- | --- |
+| Overview | Volume, p50/p95/p99, error rate and cost over time, plus a per-model breakdown. Polls every 10s. |
+| Traces | Production requests, filterable by status. Click one for the span waterfall. |
+| Prompts | The registry, with a side-by-side version diff. Judge rubrics listed separately. |
+| Evals | Run history, per-example results, and baseline-vs-candidate comparison. |
+| Settings | API keys and alert rules. |
+
+The browser never holds a credential — Next.js server code calls the API and the
+key stays server-side. That is why CORS is only opened for localhost.
+
+### Alerting
+
+```bash
+curl -X POST localhost:8000/projects/demo/alerts \
+  -H 'content-type: application/json' \
+  -d '{"name":"high error rate","metric":"error_rate","comparison":"above",
+       "threshold":0.05,"window_seconds":300,"min_sample_size":5,
+       "cooldown_seconds":900,"webhook_url":"https://example.test/hook"}'
+```
+
+The worker evaluates every rule once a minute. Four gates before anything is
+sent: cooldown (so a sustained breach notifies once, not sixty times), minimum
+sample size (one failure out of three is not a 33% outage), the threshold, then
+delivery. Webhooks are HMAC-signed with `x-lo-signature` so the receiver can
+prove the alert came from you.
+
+`trace_count below N` doubles as a heartbeat — it catches a pipeline that stopped
+sending, which no threshold-above rule would ever see.
+
 ### Migrations
 
 ```bash
@@ -350,7 +388,7 @@ These are the rules the codebase actually enforces, not aspirations:
 | 3 | Eval engine: datasets, evaluator plugins, async runner | ✅ Done |
 | 4 | LLM-as-judge, retrieval metrics, run comparison | ✅ Done |
 | 5 | Tracing SDK, ingest API, nested spans | ✅ Done |
-| 6 | Observability dashboard | |
+| 6 | Observability dashboard + alerting | ✅ Done |
 | 7 | Guardrail sampling, review queue, labelling flywheel | |
 | 8 | API keys per project, auth across all endpoints | partial (ingest done) |
 | 9 | Kubernetes manifests, Terraform for GCP | |
@@ -365,3 +403,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0005 — Eval engine: execution, evaluators, providers](docs/adr/0005-eval-engine.md)
 - [ADR 0006 — Judges as prompts, retrieval metrics, comparison](docs/adr/0006-judge-retrieval-comparison.md)
 - [ADR 0007 — Tracing: spans, ingestion, the SDK contract](docs/adr/0007-tracing-and-ingestion.md)
+- [ADR 0008 — Dashboard metrics, the BFF, and alerting](docs/adr/0008-dashboard-and-alerting.md)

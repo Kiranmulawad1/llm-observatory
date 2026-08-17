@@ -13,11 +13,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from lo_core.config import get_settings
 from lo_core.db import dispose_engine
 from lo_core.logging import configure_logging, get_logger
+from lo_worker.tasks.alerting import evaluate_alerts
 from lo_worker.tasks.evaluation import run_eval
 
 log = get_logger(__name__)
@@ -43,6 +45,12 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 class WorkerSettings:
     functions = [ping, run_eval]
+
+    # Alert rules are evaluated once a minute. A minute is the resolution the
+    # rules themselves are specified at (window_seconds is >= 60), so a tighter
+    # schedule would re-answer an unchanged question; a looser one would delay
+    # every alert by the difference.
+    cron_jobs = [cron(evaluate_alerts, second=0, run_at_startup=False)]
     on_startup = startup
     on_shutdown = shutdown
 

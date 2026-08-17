@@ -909,8 +909,8 @@ The trap is describing *features*. Describe **decisions and their consequences**
 | 3 | Eval engine, datasets, evaluators, async runner | ✅ |
 | 4 | Judge, retrieval metrics, run comparison | ✅ |
 | 5 | Tracing SDK, ingest API, nested spans | ✅ |
-| 6 | Observability dashboard (Next.js) + alerting | next |
-| 7 | Guardrail sampling, review queue, flywheel | |
+| 6 | Observability dashboard (Next.js) + alerting | ✅ |
+| 7 | Guardrail sampling, review queue, flywheel | next |
 | 8 | API keys per project, auth everywhere | partial (ingest done) |
 | 9 | Kubernetes manifests, Terraform for GCP | |
 | 10 | CI/CD with plan → approve → apply | |
@@ -1273,7 +1273,278 @@ thread; your request already returned.
 
 ---
 
-## 11. Where to look when you're stuck
+## 11. Phase 6 — the dashboard, explained
+
+Five phases of backend, and the frontend was still the `create-next-app` starter.
+This phase builds every view at once, plus the alerting deferred from Phase 5.
+
+### 11.1 Why the browser never touches the API
+
+This is the single most important idea in the frontend, and it has a name: the
+**BFF** (backend-for-frontend) pattern.
+
+```
+Browser  ──►  Next.js server  ──►  FastAPI
+             (holds the key)
+```
+
+The browser talks *only* to your Next.js app. Next.js server code adds the API
+key and calls FastAPI. The key never reaches the browser, so nobody can open
+devtools, copy it, and call your API directly.
+
+This is why `apps/api` only opens CORS for `localhost:3000` — in production the
+browser has no reason to reach the API at all.
+
+There's one wrinkle. Server Components render once, on the server. But a *live*
+dashboard has to refetch every 10 seconds from the browser. So there's a proxy
+route:
+
+```ts
+// src/app/api/proxy/[...path]/route.ts
+export async function GET(request, { params }) { ... }
+```
+
+**Note it's `GET` only.** A general passthrough that forwarded any method would
+hand the browser your entire authenticated API — exactly what the BFF pattern
+exists to prevent. Mutations go through Server Actions that validate their own
+input.
+
+### 11.2 Why the metrics queries look the way they do
+
+Every number on the dashboard comes from one SQL shape:
+
+```sql
+SELECT time_bucket('1 minute', started_at) AS bucket,
+       count(*),
+       count(*) FILTER (WHERE status = 'error'),
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms),
+       sum(cost_usd)
+FROM telemetry.spans
+WHERE project_id = $1 AND started_at > now() - interval '1 hour'
+GROUP BY bucket ORDER BY bucket;
+```
+
+Three things to notice:
+
+**`time_bucket()` is Timescale's.** It rounds timestamps down to a fixed
+interval, so every row in the same minute lands in the same bucket. Plain
+Postgres would need `date_trunc`, which can't do arbitrary intervals like "5
+minutes".
+
+**The `WHERE started_at > ...` is not optional.** A hypertable is split into
+chunks by time. A query *with* a time bound skips every chunk that can't contain
+matches. A query *without* one scans every chunk ever written — which defeats
+the only reason to partition. That's why the API supplies a 24-hour default
+rather than leaving the window optional.
+
+**`percentile_cont` is exact, not approximate.** It sorts the durations in the
+bucket and interpolates. Approximate percentile algorithms are faster but wrong
+in the tail — which is exactly where you were looking when you asked for p99.
+
+### 11.3 The continuous-aggregates decision (worth knowing for interviews)
+
+TimescaleDB's headline feature is **continuous aggregates** — materialised views
+that refresh automatically in the background. Instead of scanning a million rows
+each time, you read a few hundred pre-computed buckets.
+
+I deliberately did *not* use them, and the reasoning is the interesting part:
+
+| Cost | Why it matters here |
+| --- | --- |
+| Can't be created inside a transaction | Fights Alembic, which wraps migrations in one |
+| Refresh runs on a policy | Dashboard becomes seconds stale — on a view whose whole job is "right now" |
+| Percentiles can't be materialised | Needs the `timescaledb_toolkit` extension, which the base image doesn't ship |
+| Two code paths | Counts from the aggregate, percentiles from raw rows — they must agree forever |
+
+At the current data volume a bounded scan takes single-digit milliseconds. The
+trigger to revisit is **measured, not guessed**: when a one-hour window stops
+returning in double-digit milliseconds.
+
+The mature answer in an interview isn't "I used the fancy feature" — it's "I know
+the feature, here's precisely when it starts paying for itself, and here's why it
+doesn't yet."
+
+### 11.4 Charts: why hand-rolled SVG
+
+No Recharts, no Chart.js. `src/components/charts.tsx` draws SVG directly.
+
+The reason is control. The specs I was building to are precise — 2px strokes,
+rounded bar ends anchored to the baseline, a 2px gap between neighbouring bars,
+a recessive grid, crosshair tooltips — and bending a library's defaults into all
+of that is more code than just drawing it.
+
+Three rules that are worth internalising, because they're where most charts go
+wrong:
+
+**One y-axis. Always.** p50, p95 and p99 share a scale because they're the same
+measurement. A dual-axis chart (two different y-scales) is the single most common
+charting mistake — it makes any two series look correlated, because you chose the
+scales that made them line up.
+
+**Colour follows the entity, never its position.** Span kinds map to fixed
+palette slots, so `retrieval` is the same colour in every trace you open. If
+colour were assigned by list position, filtering one kind out would repaint
+everything else.
+
+**Identity is never colour alone.** Charts with 2+ series always get a legend.
+Diff lines carry `+`/`−` prefixes. Deltas show an arrow *and* a sign. Status
+pills contain the word. All of it still reads in greyscale, and to a colourblind
+reader.
+
+### 11.5 The span waterfall
+
+The trace detail page draws a waterfall, not a table, and the form is chosen by
+the question:
+
+```
+answer_question   ████████████████████████  103ms
+  retrieval       ███████                    47ms
+    rerank        ██                         12ms
+  generation             ████████            53ms
+```
+
+A table of durations makes you compare numbers. A waterfall shows *sequencing and
+overlap* — you can see that generation started after retrieval finished, so they
+were serial, not parallel. Horizontal position encodes when; length encodes how
+long.
+
+### 11.6 One React lesson the linter taught me
+
+I originally wrote this:
+
+```tsx
+useEffect(() => setMetrics(initialMetrics), [initialMetrics]);
+```
+
+"When the props change, update the state." The linter rejected it, correctly.
+That pattern causes a cascading render — React renders, the effect fires, setState
+triggers another render.
+
+The idiomatic fix is to let React do it:
+
+```tsx
+<MetricsView key={window} ... />
+```
+
+Changing `key` remounts the component, so fresh props become fresh initial state.
+One render, no effect. React's own documented answer to "reset state when a prop
+changes."
+
+### 11.7 Alerting: the four gates
+
+An alert rule is a threshold on a metric over a window. The detection is one
+query. **The hard part is not being a pager-spam generator.**
+
+A rule evaluated every minute against a condition that stays true for an hour
+fires 60 times — and an alerting system that cries wolf gets muted, which is
+strictly worse than no alerting at all.
+
+So `evaluate_rule` has four gates, ordered cheapest-first:
+
+| # | Gate | Why |
+| --- | --- | --- |
+| 1 | **Cooldown** | 15 minutes by default. A sustained breach notifies once. Checked first because it's free and skips the query entirely. |
+| 2 | **Sample size** | One failure out of three requests at 3am is a 33% error rate. Minimum 5. |
+| 3 | **Threshold** | Strictly above/below, so a rule set to the current value doesn't fire forever. |
+| 4 | **Delivery** | Failures counted; 10 consecutive failures disables the rule *visibly*. |
+
+Two subtleties worth knowing:
+
+**`last_fired_at` is stamped even when delivery fails.** Otherwise a broken
+endpoint retries the same alert every single evaluation — and when it recovers,
+it gets an hour of backlog at once.
+
+**Webhooks are HMAC-signed.**
+
+```python
+signature = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+```
+
+Anyone who learns your webhook URL could otherwise forge an alert — and alert
+endpoints routinely page a human or open a ticket. The signature is over the
+*exact bytes sent*, so the receiver must verify against the raw body, not a
+re-serialised dict (different key order = different signature).
+
+**A neat trick:** `trace_count below N` is a heartbeat check. It catches a
+pipeline that stopped sending entirely — a failure no threshold-*above* rule
+would ever see.
+
+### 11.8 Why alerts run on a cron, not on ingest
+
+Evaluating alerts on every span write would mean running alert queries thousands
+of times a second to answer a question whose answer changes once a minute at
+most. Worse, it would put alert evaluation on the **ingest hot path** — so a slow
+rule becomes backpressure on a customer's application.
+
+```python
+cron_jobs = [cron(evaluate_alerts, second=0)]
+```
+
+Once a minute, in the worker, off the request path entirely.
+
+### 11.9 What's new in the file map
+
+**Backend**
+
+| File | What it does |
+| --- | --- |
+| `services/metrics.py` | `time_bucket` queries: timeseries, summary, breakdown |
+| `services/alerts.py` | The four gates, signing, delivery |
+| `db/models/alerting.py` | `alert_rules` |
+| `apps/api/routers/metrics.py` | Metrics + alert-rule endpoints |
+| `apps/worker/tasks/alerting.py` | The cron job |
+
+**Frontend**
+
+| File | What it does |
+| --- | --- |
+| `lib/api.ts` | Server-only API client — the BFF boundary |
+| `app/api/proxy/[...path]/route.ts` | GET-only proxy for client polling |
+| `components/charts.tsx` | Hand-rolled SVG line/bar charts |
+| `components/waterfall.tsx` | Span timeline |
+| `components/diff-view.tsx` | Prompt version diff |
+| `components/metrics-view.tsx` | The live dashboard |
+| `components/ui.tsx` | Stat tiles, status pills, tables |
+| `app/[project]/*` | Overview, traces, prompts, evals, settings |
+
+### 11.10 More interview answers
+
+**"Why doesn't the browser call your API directly?"**
+> Because then the browser would hold the credential. Server Components fetch
+> server-side, and a GET-only proxy route handles client polling with the key
+> attached on the server. It's also why CORS is only opened for localhost — in
+> production the browser never needs to reach the API.
+
+**"Why not use TimescaleDB continuous aggregates?"**
+> They're the right answer eventually, not now. They can't be created inside a
+> transaction, which fights Alembic; the refresh policy makes the dashboard
+> stale; and percentiles can't be materialised without the toolkit extension, so
+> I'd maintain two code paths that have to agree. At this volume a bounded scan
+> is single-digit milliseconds. The trigger to revisit is measured — when a
+> one-hour window stops returning in double-digit milliseconds.
+
+**"How do you stop an alert from spamming?"**
+> Four gates, cheapest first: a cooldown so a sustained breach notifies once, a
+> minimum sample size so one failure out of three doesn't page anyone, a strict
+> threshold, then delivery. And `last_fired_at` is stamped even on failed
+> delivery — otherwise a dead endpoint retries every evaluation and a recovered
+> one gets an hour of backlog at once.
+
+**"Why is your dashboard polling instead of using WebSockets?"**
+> Ten-second freshness is what a metrics view needs, and polling has no
+> connection state, no reconnect path, and no sticky-session problem when the API
+> scales to N pods. A live trace *tail* would be a real case for SSE — a stream of
+> discrete events rather than a periodic snapshot.
+
+**"Why did you write your own charts?"**
+> The mark specs were precise enough that customising a library was more code
+> than drawing SVG — and I wanted exact control over the things that make charts
+> honest: one shared y-axis for percentiles, colour bound to the entity rather
+> than to list position, and identity never carried by colour alone.
+
+---
+
+## 12. Where to look when you're stuck
 
 - **Why was this done this way?** → `docs/adr/` — one file per decision, each
   with the alternatives I rejected and why.
