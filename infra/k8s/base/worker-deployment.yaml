@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lo-worker
+  labels:
+    app.kubernetes.io/name: lo-worker
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lo-worker
+  strategy:
+    # Recreate, not RollingUpdate. A worker has no Service in front of it and
+    # no readiness contract to preserve; what matters is not briefly running
+    # twice the intended concurrency against the provider rate limits.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lo-worker
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: lo-worker
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Longer than the API's. An eval job holds provider calls open; arq
+      # finishes the in-flight job on SIGTERM rather than abandoning it, and
+      # a job killed halfway leaves an eval run stuck in "running".
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: worker
+          image: llm-observatory/worker:dev
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: lo-config
+            - secretRef:
+                name: lo-secrets
+          env:
+            - name: LO_SERVICE_NAME
+              value: lo-worker
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # No HTTP probes: the worker serves nothing. A liveness probe here
+          # would need an arq health key in Redis, and getting that wrong
+          # restarts workers mid-job. Absence is the honest choice until there
+          # is a real signal to check.
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

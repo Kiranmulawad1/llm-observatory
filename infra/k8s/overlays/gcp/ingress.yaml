@@ -1,0 +1,66 @@
+# GKE's native ingress: a Google Cloud HTTP(S) Load Balancer.
+#
+# `web` is the default backend; `/v1/traces` routes straight to the API,
+# because SDK ingestion should not traverse the Next.js server. The BFF exists
+# to keep a credential off the browser, and the SDK already holds its own.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lo
+  annotations:
+    kubernetes.io/ingress.class: gce
+    networking.gke.io/managed-certificates: lo-cert
+    # Redirect plain HTTP. An SDK that ships spans — including prompt text —
+    # over cleartext because someone typed http:// is a data leak, not a
+    # cosmetic problem.
+    networking.gke.io/v1beta1.FrontendConfig: lo-frontend
+spec:
+  rules:
+    - host: HOSTNAME_PLACEHOLDER
+      http:
+        paths:
+          - path: /v1/traces
+            pathType: Prefix
+            backend:
+              service:
+                name: lo-api
+                port: { number: 8000 }
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: lo-web
+                port: { number: 3000 }
+---
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: lo-frontend
+spec:
+  redirectToHttps:
+    enabled: true
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: lo-cert
+spec:
+  domains:
+    - HOSTNAME_PLACEHOLDER
+---
+# GKE's load balancer health-checks the *Service*, not the pod's readiness
+# probe, unless you tell it otherwise. Without this it probes `/` on the API
+# and marks every backend unhealthy, which presents as a 502 with healthy pods.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: lo-api
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /healthz
+    port: 8000
+  # Longer than the pod's terminationGracePeriodSeconds so the load balancer
+  # stops sending new requests before the pod goes away, rather than after.
+  connectionDraining:
+    drainingTimeoutSec: 60

@@ -1,0 +1,36 @@
+# Horizontal autoscaling on the API only.
+#
+# Not the worker: arq's concurrency is bounded per process and the real
+# constraint is provider rate limits, so scaling on CPU would add pods that sit
+# blocked on 429s. Queue-depth-driven scaling (KEDA on the arq Redis list) is
+# the right mechanism there, and is deliberately left out rather than
+# approximated badly — see ADR 0011.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: lo-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: lo-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Of the *request*, not the limit. At 70% of a 100m request a pod is
+          # using 70m, which leaves room to absorb a burst while the new pod
+          # schedules and passes its startup probe.
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Five minutes of sustained low load before removing a pod. The default
+      # is aggressive enough to thrash on a spiky workload, and span ingestion
+      # is spiky by nature.
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 30

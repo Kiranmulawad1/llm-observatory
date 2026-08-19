@@ -1,0 +1,15 @@
+# A single-node cluster in Docker. Free, disposable, and close enough to a real
+# cluster that manifests which work here are unlikely to surprise you on GKE:
+# same API server, same scheduler, same kubelet.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: llm-observatory
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30300
+        hostPort: 30300
+        protocol: TCP
+      - containerPort: 30800
+        hostPort: 30800
+        protocol: TCP

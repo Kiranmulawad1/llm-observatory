@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+#
+#   terraform init -backend-config=environments/prod/backend.tf
+#   terraform validate
+#   terraform plan -var-file=environments/prod/terraform.tfvars
+#
+# There is no apply step in this project. See the banner in main.tf.
+
+project_id  = "your-gcp-project-id"
+region      = "europe-west3"
+environment = "prod"
+
+redis_memory_gb = 1
+
+# Empty means the GKE control plane is reachable only from inside the VPC.
+# Add your office or VPN range to run kubectl from outside it.
+authorized_networks = [
+  # { cidr_block = "203.0.113.0/24", display_name = "office" },
+]

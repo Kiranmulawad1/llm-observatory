@@ -423,6 +423,55 @@ heuristics. Almost no guardrail system reports that about itself.
 
 Or do all of it in the dashboard at `/demo/review`.
 
+### Deploying
+
+Three environments, one set of base manifests:
+
+```
+infra/k8s/base              plain YAML, no templating, applies as-is
+infra/k8s/overlays/kind     local cluster: in-cluster Postgres and Redis
+infra/k8s/overlays/gcp      GKE: Memorystore, Secret Manager, managed cert
+infra/terraform             the GCP substrate — VPC, GKE, Redis, IAM, secrets
+```
+
+Run the whole platform on a real Kubernetes cluster, on your laptop, for free:
+
+```bash
+make kind-up        # single-node cluster in Docker + generated secrets
+make kind-deploy    # build, load, migrate, roll out, wait for ready
+make kind-status
+```
+
+Then http://localhost:30300 for the dashboard and http://localhost:30800/docs
+for the API. `make kind-down` removes it.
+
+Validate without a cluster or a cloud account:
+
+```bash
+make k8s-validate   # kubeconform -strict against real Kubernetes API schemas
+make tf-validate    # terraform validate against real GCP provider schemas
+make infra-check    # both, plus terraform fmt -check — what CI runs
+```
+
+**On what is and is not proven.** The Kubernetes half runs for real: CI stands
+up a `kind` cluster, applies the manifests, waits for every rollout, and smoke
+tests through the NodePort. The Terraform half is `init`, `validate` and `fmt`
+only — this project has never run `terraform apply`, there is no GCP account
+behind it, and there is deliberately no `make tf-apply` target. `validate`
+type-checks every resource argument against the downloaded provider schemas, so
+it catches a misspelled attribute or a wrong type; it cannot catch quota, IAM
+propagation, or whether a machine type exists in a zone. ADR 0011 has the full
+table of what is executed and what is not.
+
+**Two things worth reading the manifests for.** The database is a StatefulSet
+rather than Cloud SQL, because Cloud SQL cannot load the `timescaledb`
+extension that `telemetry.spans` depends on — a constraint, not a preference,
+and Redis is managed precisely because nothing forces our hand there. And no
+Secret is ever committed: locally Kustomize generates one from a gitignored
+file, in production the External Secrets Operator materialises it from GCP
+Secret Manager, and Terraform creates the secret *containers* but never a
+version — because a value passed to Terraform is a value in state.
+
 ### Migrations
 
 ```bash
@@ -472,8 +521,8 @@ These are the rules the codebase actually enforces, not aspirations:
 | 6 | Observability dashboard + alerting | ✅ Done |
 | 7 | Guardrail sampling, review queue, labelling flywheel | ✅ Done |
 | 8 | API keys per project, auth across all endpoints | ✅ Done |
-| 9 | Kubernetes manifests, Terraform for GCP | |
-| 10 | CD with plan → manual approval → apply | |
+| 9 | Kubernetes manifests, Terraform for GCP | ✅ Done |
+| 10 | CD with plan → manual approval → apply | next |
 
 ## Decisions
 
@@ -487,3 +536,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0008 — Dashboard metrics, the BFF, and alerting](docs/adr/0008-dashboard-and-alerting.md)
 - [ADR 0009 — Guardrail sampling and the data flywheel](docs/adr/0009-guardrails-and-the-flywheel.md)
 - [ADR 0010 — Authentication and authorisation](docs/adr/0010-authentication-and-authorisation.md)
+- [ADR 0011 — Deployment topology: containers, Kubernetes, GCP](docs/adr/0011-deployment-topology.md)

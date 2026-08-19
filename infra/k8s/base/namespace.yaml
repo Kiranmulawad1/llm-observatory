@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-observatory
+  labels:
+    app.kubernetes.io/name: llm-observatory
+    # Enforce the restricted Pod Security Standard at the namespace level.
+    # Every workload here already sets a compliant securityContext; this makes
+    # the cluster reject one that does not, rather than trusting us to remember.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

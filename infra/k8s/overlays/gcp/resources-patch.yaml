@@ -1,0 +1,53 @@
+# Production sizing and scheduling.
+#
+# topologySpreadConstraints, not podAntiAffinity: anti-affinity is a hard
+# yes/no per node, so with three replicas and two zones one pod stays Pending
+# forever. Spread expresses the thing actually wanted — "keep them even across
+# zones, but schedule anyway if you cannot".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lo-api
+spec:
+  replicas: 3
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-api
+      containers:
+        - name: api
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lo-worker
+spec:
+  replicas: 3
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-worker
+      containers:
+        - name: worker
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 2Gi

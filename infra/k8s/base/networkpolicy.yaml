@@ -1,0 +1,160 @@
+# Default-deny, then allow exactly what the architecture diagram shows.
+#
+# NetworkPolicy is additive-allow: with no policy, every pod can reach every
+# other pod in the cluster. The first rule below denies all ingress and egress
+# in this namespace, and the rest re-open the specific paths. Without the
+# default-deny, the allow rules are decoration.
+#
+# This is the control that turns "the web pod is compromised" into "the web pod
+# is compromised and can reach exactly the API".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  # Every pod needs to resolve names, including the database hostname. Without
+  # this the default-deny above breaks everything in a way that looks like a
+  # connection timeout rather than a DNS failure.
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lo-api
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # From the web frontend (dashboard traffic)...
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-web
+      ports:
+        - { protocol: TCP, port: 8000 }
+    # ...and from the ingress controller, which is what carries SDK span
+    # ingestion in from outside the cluster.
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ingress-controller
+      ports:
+        - { protocol: TCP, port: 8000 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-postgres
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-redis
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-web
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lo-web
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ingress-controller
+      ports:
+        - { protocol: TCP, port: 3000 }
+  egress:
+    # The web tier reaches the API and nothing else. In particular it has no
+    # route to Postgres — the BFF is an architectural boundary, and this is the
+    # network enforcing what the code already promises.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-api
+      ports:
+        - { protocol: TCP, port: 8000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  policyTypes: [Ingress, Egress]
+  # No ingress rules at all: nothing should ever connect *to* a worker.
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-postgres
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-redis
+      ports:
+        - { protocol: TCP, port: 6379 }
+    # Outbound to LLM providers. Restricted to 443 and, in the gcp overlay,
+    # forced through a NAT gateway with a fixed egress IP so the provider side
+    # can allowlist it.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Never let a worker reach cluster-internal or cloud metadata
+              # ranges. 169.254.169.254 is the metadata server: reachable, it
+              # hands out node credentials to anything that asks.
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lo-migrate
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-postgres
+      ports:
+        - { protocol: TCP, port: 5432 }

@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lo-api
+  labels:
+    app.kubernetes.io/name: lo-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lo-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the desired count during a rollout. With replicas: 2
+      # and maxUnavailable: 1 a rollout halves capacity; with 0 it adds a pod
+      # before removing one, so a deploy under load does not shed requests.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lo-api
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: lo-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Give in-flight requests time to finish. The API's own graceful shutdown
+      # is uvicorn's; this only has to be longer than the longest request.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: llm-observatory/api:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: lo-config
+            - secretRef:
+                name: lo-secrets
+          env:
+            - name: LO_SERVICE_NAME
+              value: lo-api
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Three probes, three different questions — conflating them is the
+          # classic outage.
+          #
+          #   startup:   "has it finished booting?"  Gates the other two, so a
+          #              slow start does not get counted as a liveness failure
+          #              and restart-loop forever.
+          #   readiness: "should it receive traffic?"  Hits /readyz, which
+          #              checks Postgres and Redis. A database blip pulls the
+          #              pod out of the Service and puts it back when it heals.
+          #   liveness:  "is the process wedged?"  Hits /healthz, which touches
+          #              no dependency. If liveness checked the database too, a
+          #              database outage would restart every pod in the fleet
+          #              and turn a recoverable incident into a crash loop.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # Memory only, deliberately. A memory limit is a correctness
+              # boundary — exceed it and the kernel OOM-kills the container,
+              # which is what you want for a leak. A CPU limit is throttling:
+              # the pod gets paused mid-request even when the node is idle,
+              # which shows up as p99 latency nobody can explain. Requests
+              # already guarantee the share this pod is entitled to.
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # readOnlyRootFilesystem means /tmp has to come from somewhere.
+        - name: tmp
+          emptyDir: {}

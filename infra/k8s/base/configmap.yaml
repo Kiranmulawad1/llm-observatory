@@ -1,0 +1,14 @@
+# Non-secret configuration only.
+#
+# The split matters: anything in here is world-readable to anyone with `get
+# configmap` in the namespace, and shows up in `kubectl describe`. Credentials
+# live in a Secret, sourced from GCP Secret Manager in the gcp overlay.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lo-config
+data:
+  LO_ENVIRONMENT: production
+  LO_LOG_LEVEL: INFO
+  LO_GENERATION_PROVIDER: fake
+  LO_EMBEDDING_PROVIDER: fake

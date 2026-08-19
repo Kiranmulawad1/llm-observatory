@@ -1,0 +1,73 @@
+# Schema migrations run as a Job, not as an initContainer on the API.
+#
+# An initContainer runs once per pod. With replicas: 2 that is two Alembic
+# processes racing to apply the same revision, and Alembic has no lock of its
+# own — the loser either errors or, worse, half-applies a migration that the
+# winner already ran. A Job runs exactly once.
+#
+# Ordering is the deploy pipeline's job (Phase 10): create this Job, wait for
+# completion, and only then roll the Deployments. `kubectl apply -k` alone does
+# not order resources, and pretending otherwise is how you ship code that
+# expects a column the database does not have yet.
+#
+#   kubectl delete job lo-migrate -n llm-observatory --ignore-not-found
+#   kubectl apply -k infra/k8s/overlays/<env>
+#   kubectl wait --for=condition=complete job/lo-migrate -n llm-observatory --timeout=300s
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lo-migrate
+  labels:
+    app.kubernetes.io/name: lo-migrate
+    app.kubernetes.io/component: migration
+spec:
+  # Retry a genuinely transient failure (the database was still accepting
+  # connections but not yet ready), then stop. An unbounded retry on a broken
+  # migration hammers the database and hides the error in a wall of restarts.
+  backoffLimit: 3
+  # Clean the Job up after it succeeds so the next deploy is not blocked by a
+  # completed object with the same name.
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lo-migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: lo-migrate
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # The API image: it already contains alembic, the migration scripts
+          # and the models. A separate migration image would be a second thing
+          # to build and a second chance for the two to drift apart.
+          image: llm-observatory/api:dev
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: lo-config
+            - secretRef:
+                name: lo-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

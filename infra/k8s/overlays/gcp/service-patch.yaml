@@ -1,0 +1,14 @@
+# Attach the BackendConfig so the Google load balancer health-checks /healthz
+# rather than /.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lo-api
+  annotations:
+    cloud.google.com/backend-config: '{"default": "lo-api"}'
+    # Container-native load balancing: the LB targets pod IPs directly through
+    # a Network Endpoint Group instead of hopping via kube-proxy on a node.
+    # One less hop, and pod readiness actually governs traffic.
+    cloud.google.com/neg: '{"ingress": true}'
+spec:
+  type: ClusterIP

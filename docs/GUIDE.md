@@ -912,8 +912,8 @@ The trap is describing *features*. Describe **decisions and their consequences**
 | 6 | Observability dashboard (Next.js) + alerting | ✅ |
 | 7 | Guardrail sampling, review queue, flywheel | ✅ |
 | 8 | API keys per project, auth everywhere | ✅ |
-| 9 | Kubernetes manifests, Terraform for GCP | next |
-| 10 | CI/CD with plan → approve → apply | |
+| 9 | Kubernetes manifests, Terraform for GCP | ✅ |
+| 10 | CI/CD with plan → approve → apply | next |
 
 **Phase 5 is a real shift.** Everything so far writes to the `control` schema:
 low volume, transactional, foreign keys everywhere. Traces are the opposite —
@@ -2110,7 +2110,384 @@ someone who has thought about why IDOR keeps happening to everyone else.
 
 ---
 
-## 14. Where to look when you're stuck
+## 14. Phase 9 — shipping it, explained
+
+### What changed
+
+Up to now this ran on your laptop under docker-compose. This phase makes it
+deployable: manifests a real cluster accepts, and infrastructure-as-code for
+the machines underneath.
+
+Two halves, and they are not equally proven — say so out loud, because the
+difference is the whole point of the phase:
+
+- **Kubernetes runs for real.** A `kind` cluster (Kubernetes in Docker, free,
+  on your machine) gets the actual manifests applied to it, and CI does the
+  same on every pull request.
+- **Terraform is validated, never applied.** No GCP account, no billing, no
+  spend. There is deliberately no `make tf-apply`.
+
+### Kustomize vs Helm, and why I picked the less famous one
+
+Helm is the one everyone has heard of. It templates YAML: you write
+`replicas: {{ .Values.replicaCount }}` and fill it in at install time.
+
+Its actual purpose is **distribution** — letting strangers install your
+software into clusters you have never seen, configured for their environment.
+That is why every vendor ships a chart.
+
+We are not distributing anything. We deploy one application we control. And
+Helm's price is steep for that case: your manifests stop being YAML and become
+Go templates that *produce* YAML. Indentation gets computed by a function
+called `nindent`. Conditionals wrap block scalars. You cannot read a diff and
+know what will be applied — you have to render it first.
+
+Kustomize takes the other approach: **a base of plain, valid YAML, plus
+patches**.
+
+```
+base/                 real YAML — you can `kubectl apply -f` it directly
+overlays/kind/        patch: 1 replica, NodePort, in-cluster Postgres
+overlays/gcp/         patch: 3 replicas, Ingress, secrets from Secret Manager
+```
+
+The base is readable, diffable, and checkable by a schema validator. Overlays
+say what differs rather than wrapping everything in conditionals.
+
+When I would switch to Helm: the day someone outside this repository has to
+install the platform, or the day there are more than about four environments.
+Both are "distribution" problems, which is what Helm is actually for.
+
+### The decision I did not get to make: the database
+
+Here is the constraint that shaped the entire GCP design.
+
+`telemetry.spans` is a **TimescaleDB hypertable** (Phase 5, ADR 0003). The
+migration literally calls `create_hypertable()`. TimescaleDB is a PostgreSQL
+*extension*.
+
+**Cloud SQL for PostgreSQL cannot load that extension.** Neither can AlloyDB.
+Google publishes a list of supported extensions and `timescaledb` is not on it.
+So "just use managed Postgres" does not fail gracefully or perform worse — the
+migration errors out and the deploy stops.
+
+Three real options:
+
+1. **Timescale Cloud.** Managed, correct, third-party, costs money. The right
+   answer with a budget. Rejected here on the $0 constraint, and it puts your
+   primary datastore outside your VPC.
+2. **Rewrite telemetry onto native partitioning.** Cloud SQL supports plain
+   PostgreSQL declarative partitioning. You lose what the hypertable was chosen
+   for: automatic chunk exclusion, `time_bucket()`, native compression. This is
+   rewriting your storage layer to suit your hosting bill — the tail wagging
+   the dog.
+3. **Self-host TimescaleDB on Kubernetes**, as a StatefulSet with a persistent
+   volume. Zero code change, one DSN, byte-identical to local.
+
+I took option 3, and the honest accounting is that backups, failover, major
+version upgrades and volume resizing are now *ours*. "Don't run your database
+on Kubernetes" is good advice — **when a managed option exists**. Here, for
+this workload, one does not.
+
+Notice what I did *not* do: Redis is Memorystore, fully managed. Nothing forces
+our hand there, so managed wins. The principle is **managed where managed
+works, self-hosted only where a hard constraint forces it** — not a blanket
+preference either way. That distinction is the difference between an engineer
+with a rule and an engineer with a reason.
+
+### Why a StatefulSet and not a Deployment
+
+A Deployment assumes its pods are interchangeable. A database pod is not: it
+owns a specific disk. If a Deployment rolls, it can start a second pod before
+stopping the first, and both attach the same volume — which is how you corrupt
+a database.
+
+A StatefulSet gives each pod a stable name (`lo-postgres-0`) and its own
+PersistentVolumeClaim that follows it, and it never runs two of the same
+ordinal at once.
+
+One small thing in there worth knowing, because it wastes an afternoon the
+first time:
+
+```yaml
+- name: PGDATA
+  value: /var/lib/postgresql/data/pgdata     # a SUBDIRECTORY, not the mount
+```
+
+Kubernetes creates the volume's root directory with permissions from `fsGroup`.
+`initdb` inspects its data directory and *refuses to start* if the permissions
+are more open than 0700. A subdirectory is created by initdb itself, with the
+permissions it wants.
+
+### Three probes that answer three different questions
+
+This is the part people get wrong, and the failure mode is spectacular.
+
+```yaml
+startupProbe:    /healthz   periodSeconds: 2, failureThreshold: 30
+readinessProbe:  /readyz    checks Postgres + Redis
+livenessProbe:   /healthz   checks nothing external
+```
+
+- **startup** — "has it finished booting?" It *gates the other two*, so a slow
+  start is not mistaken for a hung process and restart-looped forever.
+- **readiness** — "should this pod get traffic?" It hits `/readyz`, which pings
+  the database and Redis. If the database blips, the pod leaves the Service and
+  rejoins when it heals.
+- **liveness** — "is this process wedged and only a restart will fix it?" It
+  hits `/healthz`, which touches **no dependency**.
+
+Now the trap. Suppose liveness also checked the database. The database goes
+down. Every liveness probe in the fleet fails. Kubernetes restarts every pod.
+They come back, still can't reach the database, fail again, and enter
+`CrashLoopBackOff` with exponential backoff. The database comes back — and your
+entire fleet is now in a backoff cycle and takes far longer to recover than the
+outage that caused it.
+
+**Readiness may depend on your dependencies. Liveness may not.**
+
+### Memory limits, no CPU limits
+
+```yaml
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits:   { memory: 512Mi }        # note: no cpu
+```
+
+These are two different mechanisms wearing the same word.
+
+- Exceeding a **memory** limit gets the container OOM-killed. That is a
+  correctness boundary, and it is exactly what you want for a leak.
+- Exceeding a **CPU** limit gets you *throttled* — the kernel pauses your
+  process for the rest of the scheduling period. Even if the node is completely
+  idle. It shows up as p99 latency that correlates with nothing.
+
+The `request` already guarantees your share when the node is contended. A CPU
+limit only adds artificial pauses when it is not. Omitting it is a deliberate,
+defensible choice, and being able to explain why is worth more in an interview
+than any manifest on this page.
+
+### Default-deny networking
+
+By default, **every pod in a Kubernetes cluster can reach every other pod.**
+People are routinely surprised by this. Namespaces are not a network boundary.
+
+```yaml
+kind: NetworkPolicy
+metadata: { name: default-deny }
+spec:
+  podSelector: {}              # every pod
+  policyTypes: [Ingress, Egress]
+                               # no rules = nothing allowed
+```
+
+Then each allow rule opens exactly one path. The ordering matters
+conceptually: without the default-deny first, the allow rules are decoration,
+because everything was already permitted.
+
+Two details I would point at in a review:
+
+**The web tier cannot reach Postgres.** Not "does not" — *cannot*. The BFF
+boundary from Phase 6 said the browser must never hold a credential and the
+Next.js server must go through the API. Now the network enforces what the code
+promised.
+
+**Workers cannot reach `169.254.169.254`.** That is the cloud metadata server.
+It is reachable from every pod by default and it hands out node credentials to
+anything that asks. It is how a compromised container becomes a compromised
+cluster, and it is the single line on the page most likely to matter.
+
+### Migrations: a Job, not an initContainer
+
+Tempting: add an initContainer to the API deployment that runs
+`alembic upgrade head` before the app starts.
+
+Wrong: an initContainer runs **once per pod**. With `replicas: 2` that is two
+Alembic processes racing on the same revision. Alembic has no lock of its own.
+The loser either errors, or half-applies something the winner already did.
+
+A `Job` runs exactly once. But there is a second half people miss:
+
+```bash
+kubectl apply -k infra/k8s/overlays/kind   # does NOT order resources
+```
+
+Kustomize and `kubectl apply` do not sequence anything. The Job and the
+Deployments are created together, so the new code can start against a schema
+that has not been migrated yet. The ordering lives in the deploy pipeline:
+
+```bash
+kubectl apply -k ...
+kubectl wait --for=condition=complete job/lo-migrate --timeout=300s
+kubectl rollout status deployment/lo-api
+```
+
+### Secrets: three mechanisms, one interface
+
+`base/` refers to a Secret called `lo-secrets` and knows nothing else about it.
+
+| environment | where the value lives | how it becomes a Secret |
+| --- | --- | --- |
+| local | `.env` | pydantic-settings reads it |
+| kind | gitignored `secrets.env` | Kustomize `secretGenerator` |
+| GCP | Secret Manager | External Secrets Operator |
+
+The GCP chain has no password anywhere in it, which is the interesting part:
+
+1. Terraform creates the Secret Manager **container** — never a version.
+2. A human writes the value once: `gcloud secrets versions add`.
+3. The `lo-secrets` Kubernetes ServiceAccount is bound to a Google service
+   account via **Workload Identity**, so the pod gets a short-lived token. No
+   JSON key file exists to be stolen.
+4. The operator reads Secret Manager and creates the Kubernetes Secret.
+
+Step 1 is the one to understand. This is **wrong**, and it is common:
+
+```hcl
+resource "google_secret_manager_secret_version" "bad" {
+  secret_data = var.database_password     # now in terraform.tfstate
+}
+```
+
+Terraform state records the full value of every attribute, in plaintext, in a
+JSON file in a bucket that CI can read. `sensitive = true` only hides it from
+the *console output*. It changes nothing about state. So Terraform creates the
+empty container and the IAM binding, and the value is written out of band.
+
+A nice consequence: rotating a credential is `versions add` plus a rollout. It
+does not require a Terraform plan and apply, so Terraform is not in the
+critical path of an incident.
+
+Locally, `make kind-up` generates **real random** values with
+`secrets.token_urlsafe`, not a placeholder. A committed dev password is the one
+that eventually gets reused where it matters.
+
+### Workload Identity, and the thing it replaces
+
+The old way to let a pod call a cloud API: create a service account, download a
+JSON key, mount it as a Secret. That key never expires. It gets copied into
+`.env` files, pasted into Slack, committed by accident, and baked into images.
+It is the number-one source of cloud breaches.
+
+Workload Identity: the Kubernetes ServiceAccount is *bound* to a Google service
+account. The pod presents a projected, short-lived token; GCP exchanges it. No
+long-lived credential exists anywhere.
+
+The same idea covers CI. GitHub Actions mints an OIDC token, GCP trades it for
+a short-lived access token — no key in repository secrets. With one line that
+absolutely must be right:
+
+```hcl
+attribute_condition = "assertion.repository == '${var.github_repository}'"
+```
+
+Without that condition, **any GitHub repository on earth** can federate into
+your project. It is the most misconfigured line in GCP.
+
+### What "validated" honestly means
+
+| | executed? | how |
+| --- | --- | --- |
+| Dockerfiles | yes | built locally and in CI |
+| Kustomize render | yes | all three overlays, in CI |
+| Manifest schemas | yes | `kubeconform -strict` |
+| Manifests in a cluster | yes | a real `kind` cluster |
+| Terraform syntax + types | yes | `validate` against real provider schemas |
+| **Terraform apply** | **no** | no account, no billing, by design |
+
+`terraform validate` is more than a syntax check — it downloads the real
+provider schemas and type-checks every resource argument, so a misspelled
+attribute or wrong type fails. It cannot know anything only the GCP API knows:
+quota, IAM propagation delays, whether a machine type exists in that zone.
+
+Say this plainly rather than implying a green check means "this deploys". An
+interviewer who has run Terraform will trust you *more* for the distinction,
+not less.
+
+### What to test by hand
+
+Needs Docker with a few GB of free disk — `kind` runs a real cluster inside it.
+
+```bash
+make kind-up        # single-node cluster + generated random secrets
+make kind-deploy    # build, load, migrate, roll out, wait for ready
+make kind-status
+```
+
+Expect `lo-postgres-0`, `lo-redis-0`, and one each of api/worker/web `Running`,
+plus `lo-migrate` `Completed`. Then:
+
+```bash
+curl localhost:30800/healthz                 # {"status":"alive"}
+curl -i localhost:30800/projects             # 401 — auth is on in-cluster too
+open http://localhost:30300                  # the dashboard
+```
+
+Prove the network policy is real:
+
+```bash
+# The web pod must NOT be able to reach Postgres. This should hang, then fail.
+kubectl exec -n llm-observatory deploy/lo-web -- \
+  timeout 5 sh -c 'nc -z lo-postgres 5432' ; echo "exit=$?"
+```
+
+(That test only means something if your CNI enforces NetworkPolicy. `kind`'s
+default CNI historically did not — if it exits 0, check `kubectl get
+networkpolicy` exists and treat enforcement as unverified locally rather than
+assuming the policy is wrong.)
+
+Watch a probe do its job:
+
+```bash
+kubectl scale statefulset/lo-postgres -n llm-observatory --replicas=0
+kubectl get pods -n llm-observatory -w      # api goes NOT READY, but does NOT restart
+kubectl scale statefulset/lo-postgres -n llm-observatory --replicas=1
+                                            # api becomes READY again on its own
+```
+
+That is the readiness/liveness split working: traffic stops, the process
+survives, and it recovers without human intervention. Then:
+
+```bash
+make k8s-validate
+make tf-validate
+make kind-down
+```
+
+### Simplifications, and what production adds
+
+- **No backups for the self-hosted database.** The biggest gap by far. A
+  `VolumeSnapshot` schedule at minimum, realistically `pgBackRest` — plus a
+  *rehearsed restore*, because an untested backup is a hypothesis.
+- **Workers do not autoscale.** The HPA covers the API on CPU. Workers should
+  scale on arq queue depth (KEDA); scaling them on CPU adds pods that sit
+  blocked on provider 429s, so it is omitted rather than approximated badly.
+- **One database replica.** A zone outage is an outage.
+- **No mTLS between tiers.** NetworkPolicy controls who may connect, not who
+  they are.
+- **Rolling updates, not canaries.** Argo Rollouts or Flagger would shift
+  traffic gradually and roll back automatically on error rate.
+- **No policy engine.** Pod Security Standards are set per namespace;
+  Kyverno or Gatekeeper would enforce repo-wide rules (`no :latest`, resources
+  always set) instead of relying on review.
+
+### How this reads on a résumé
+
+Not "wrote Kubernetes manifests and Terraform". The story is:
+
+> Chose self-hosted TimescaleDB over Cloud SQL because the managed service
+> cannot load the extension the telemetry schema depends on — and kept Redis
+> managed, because nothing forced that one — then enforced the resulting
+> architecture in the network layer with default-deny policies, and verified
+> the whole deployment on an ephemeral cluster in CI.
+
+Every clause there is a decision with a reason and a cost. That is what
+platform engineering interviews are actually probing for, and it is a very
+different conversation from "I built a RAG pipeline".
+
+---
+
+## 15. Where to look when you're stuck
 
 - **Why was this done this way?** → `docs/adr/` — one file per decision, each
   with the alternatives I rejected and why.

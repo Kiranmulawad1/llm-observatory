@@ -1,0 +1,26 @@
+# Budgets for *voluntary* disruption — node drains, cluster upgrades, autoscaler
+# scale-down. They do not protect against a node dying; nothing does.
+#
+# minAvailable: 1 rather than a percentage. With 2 replicas, `maxUnavailable:
+# 50%` and `minAvailable: 1` agree; if someone later scales to 1 replica, the
+# percentage silently permits taking the last pod down while this does not —
+# the drain blocks and a human finds out, which is the correct failure.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: lo-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lo-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: lo-web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lo-web

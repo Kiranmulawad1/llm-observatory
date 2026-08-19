@@ -133,6 +133,145 @@ jobs:
       - run: npm run lint
       - run: npm run build
 
+  infra:
+    name: Infrastructure validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+          # The wrapper intercepts stdout to expose it as step outputs, which
+          # mangles multi-line plan output for anything downstream.
+          terraform_wrapper: false
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive infra/terraform
+
+      # -backend=false: initialise providers and modules without touching the
+      # GCS state bucket. CI has no credentials for it and does not need any —
+      # validation is a local, offline, type-checking operation.
+      - name: Terraform init
+        run: terraform -chdir=infra/terraform init -backend=false
+
+      # This is the step that earns its keep. `validate` resolves every
+      # resource argument against the downloaded provider schemas, so a
+      # misspelled attribute or a wrong type fails here rather than half way
+      # through an apply that has already created a VPC.
+      - name: Terraform validate
+        run: terraform -chdir=infra/terraform validate
+
+      - uses: yokawasa/action-setup-kube-tools@v0.11.2
+        with:
+          kubectl: "1.32.0"
+          kubeconform: "0.6.7"
+
+      - name: Render and validate every overlay
+        run: |
+          set -euo pipefail
+          for overlay in base overlays/kind overlays/gcp; do
+            echo "::group::$overlay"
+            # Rendering is itself a test: a bad patch target or a missing
+            # resource fails here, and it is the failure mode Kustomize is
+            # most prone to.
+            kubectl kustomize "infra/k8s/$overlay" > "/tmp/$(basename "$overlay").yaml"
+            echo "::endgroup::"
+          done
+          kubeconform -strict -summary /tmp/base.yaml
+          kubeconform -strict -summary /tmp/kind.yaml
+          # The gcp overlay references CRDs (ManagedCertificate, BackendConfig,
+          # ExternalSecret) whose schemas only exist inside a cluster that has
+          # them installed. Skipped, not ignored — everything else is strict.
+          kubeconform -strict -summary -ignore-missing-schemas /tmp/gcp.yaml
+
+      # Cheap, high-value invariant: no committed Secret object, anywhere.
+      #
+      # Checking for a `data:` key would be wrong — ConfigMaps legitimately
+      # have one. What must not exist is a `kind: Secret` manifest in the
+      # repository at all: locally the Secret is generated from a gitignored
+      # envs file, and in production it is materialised in-cluster by the
+      # External Secrets Operator from GCP Secret Manager. Either way it is
+      # never a file. This is what stops the convenient shortcut from being
+      # merged on a Friday afternoon.
+      - name: Reject committed Secret manifests
+        run: |
+          if grep -rn --include='*.yaml' -E '^\s*kind:\s*Secret\s*$' infra/k8s; then
+            echo "::error::no Secret manifest may be committed (see ADR 0011)"
+            exit 1
+          fi
+          # And the rendered output must not contain a literal credential
+          # either — a secretGenerator pointed at a committed file would slip
+          # past the check above.
+          if git ls-files --error-unmatch infra/k8s/overlays/kind/secrets.env 2>/dev/null; then
+            echo "::error::infra/k8s/overlays/kind/secrets.env must stay gitignored"
+            exit 1
+          fi
+
+  kind-e2e:
+    name: Deploy to a real cluster
+    runs-on: ubuntu-latest
+    needs: [python-quality, python-tests, web-quality]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: llm-observatory
+          config: infra/k8s/overlays/kind/kind-cluster.yaml
+
+      - name: Build and load images
+        run: |
+          docker build -f apps/api/Dockerfile    -t llm-observatory/api:dev .
+          docker build -f apps/worker/Dockerfile -t llm-observatory/worker:dev .
+          docker build -f apps/web/Dockerfile    -t llm-observatory/web:dev apps/web
+          kind load docker-image llm-observatory/api:dev    --name llm-observatory
+          kind load docker-image llm-observatory/worker:dev --name llm-observatory
+          kind load docker-image llm-observatory/web:dev    --name llm-observatory
+
+      - name: Generate cluster secrets
+        run: |
+          PGPASS=$(python3 -c "import secrets;print(secrets.token_urlsafe(24))")
+          cat > infra/k8s/overlays/kind/secrets.env <<EOF
+          POSTGRES_PASSWORD=$PGPASS
+          LO_DATABASE_URL=postgresql+asyncpg://lo:$PGPASS@lo-postgres:5432/llm_observatory
+          LO_REDIS_URL=redis://lo-redis:6379/0
+          LO_API_KEY_PEPPER=$(python3 -c "import secrets;print(secrets.token_urlsafe(32))")
+          LO_ADMIN_TOKEN=$(python3 -c "import secrets;print(secrets.token_urlsafe(32))")
+          EOF
+
+      # The manifests are only really validated by a cluster accepting them and
+      # the pods becoming ready. Schema validation catches typos; this catches
+      # a probe pointing at the wrong path, a secret key that does not exist,
+      # and a securityContext the image cannot actually run under.
+      - name: Deploy
+        run: |
+          kubectl apply -k infra/k8s/overlays/kind
+          kubectl wait --for=condition=complete job/lo-migrate -n llm-observatory --timeout=300s
+          kubectl rollout status deployment/lo-api    -n llm-observatory --timeout=300s
+          kubectl rollout status deployment/lo-worker -n llm-observatory --timeout=300s
+          kubectl rollout status deployment/lo-web    -n llm-observatory --timeout=300s
+
+      - name: Smoke test through the NodePort
+        run: |
+          set -euo pipefail
+          ADMIN=$(grep '^LO_ADMIN_TOKEN=' infra/k8s/overlays/kind/secrets.env | cut -d= -f2)
+          curl -fsS localhost:30800/healthz
+          curl -fsS localhost:30800/readyz
+          # Auth is on in the cluster too, so an unauthenticated call must fail.
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:30800/projects)" = 401
+          curl -fsS -X POST localhost:30800/projects \
+            -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+            -d '{"slug":"smoke","name":"Smoke"}'
+          curl -fsS localhost:30300 > /dev/null
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -n llm-observatory -o wide
+          kubectl describe pods -n llm-observatory
+          kubectl logs -n llm-observatory -l app.kubernetes.io/part-of=llm-observatory --all-containers --tail=200
+
   images:
     name: Build images
     runs-on: ubuntu-latest

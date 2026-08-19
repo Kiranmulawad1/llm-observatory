@@ -1,0 +1,41 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: llm-observatory
+
+resources:
+  - ../../base
+  - external-secret.yaml
+  - ingress.yaml
+  - hpa.yaml
+
+patches:
+  - path: resources-patch.yaml
+  - path: service-patch.yaml
+
+configMapGenerator:
+  - name: lo-config
+    behavior: merge
+    literals:
+      - LO_ENVIRONMENT=production
+      - LO_GENERATION_PROVIDER=anthropic
+      - LO_EMBEDDING_PROVIDER=openai
+
+# No secretGenerator here. The Secret named `lo-secrets` is created in-cluster
+# by the External Secrets Operator from GCP Secret Manager, so it never exists
+# in this repository, in a rendered manifest, or in Terraform state.
+
+# Placeholder tags. CI replaces these with immutable digests before applying:
+#   kustomize edit set image llm-observatory/api=$REGISTRY/api@sha256:...
+# A tag can be re-pointed at different bytes after review; a digest cannot,
+# which is the whole reason to deploy by digest.
+images:
+  - name: llm-observatory/api
+    newName: REGION-docker.pkg.dev/PROJECT_ID/llm-observatory/api
+    newTag: latest
+  - name: llm-observatory/worker
+    newName: REGION-docker.pkg.dev/PROJECT_ID/llm-observatory/worker
+    newTag: latest
+  - name: llm-observatory/web
+    newName: REGION-docker.pkg.dev/PROJECT_ID/llm-observatory/web
+    newTag: latest

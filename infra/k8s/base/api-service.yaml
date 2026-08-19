@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lo-api
+  labels:
+    app.kubernetes.io/name: lo-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: lo-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
