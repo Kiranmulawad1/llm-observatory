@@ -91,8 +91,13 @@ class TestApiKeys:
     async def test_missing_header_is_401_with_www_authenticate(
         self, client: httpx.AsyncClient
     ) -> None:
+        # The fixture authenticates as the operator by default, so "no
+        # credential" has to be stated explicitly — an empty Authorization
+        # header is what an unauthenticated client actually sends.
         response = await client.post(
-            "/v1/traces", json={"spans": [span_payload(hex_id(32), hex_id(16))]}
+            "/v1/traces",
+            json={"spans": [span_payload(hex_id(32), hex_id(16))]},
+            headers={"Authorization": ""},
         )
         assert response.status_code == 401
         assert response.json()["code"] == "unauthorized"

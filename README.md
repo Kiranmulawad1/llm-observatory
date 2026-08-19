@@ -155,19 +155,59 @@ make typecheck    # mypy strict
 make help         # everything else
 ```
 
+### Authenticating
+
+Every endpoint requires a credential. There are two kinds, and the difference
+matters:
+
+| | `LO_ADMIN_TOKEN` | project API key (`lo_live_…`) |
+| --- | --- | --- |
+| Belongs to | whoever runs the platform | one project |
+| Created by | `make bootstrap`, into `.env` | `POST /projects/{slug}/api-keys` |
+| Can do | create projects, issue keys, read any project | whatever its scopes allow, in its project only |
+| Cannot do | ingest spans | anything in another project |
+| Stored as | config, never in the database | SHA-256 + server pepper — plaintext shown once |
+
+Both travel as `Authorization: Bearer <credential>`. `/healthz` and `/readyz`
+are the only open routes, because probes cannot hold secrets.
+
+```bash
+export LO_ADMIN_TOKEN=$(grep '^LO_ADMIN_TOKEN=' .env | cut -d= -f2)
+curl -X POST localhost:8000/projects \
+  -H "Authorization: Bearer $LO_ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d '{"slug":"demo","name":"Demo"}'
+```
+
+Scopes are `ingest`, `read`, `write`, and `admin`. `admin` implies read and
+write; **`ingest` is implied by nothing**, not even `admin`. Ingestion is the
+only capability handed to code running outside your infrastructure, so a
+leaked dashboard credential — or the operator token itself — still cannot
+forge telemetry into a project.
+
+Asking for a project your key does not belong to returns **404, not 403**. A
+403 would confirm the slug exists, which hands an attacker a free list of
+your tenants.
+
+Every `curl` example below uses this helper, so the credential appears once
+rather than in twenty snippets:
+
+```bash
+lo() { curl -s -H "Authorization: Bearer $LO_ADMIN_TOKEN" "$@"; }
+```
+
 ### Trying the prompt registry
 
 ```bash
-curl -X POST localhost:8000/projects \
+lo -X POST localhost:8000/projects \
   -H 'content-type: application/json' \
   -d '{"slug":"demo","name":"Demo"}'
 
-curl -X POST localhost:8000/projects/demo/prompts \
+lo -X POST localhost:8000/projects/demo/prompts \
   -H 'content-type: application/json' \
   -d '{"slug":"support-triage","name":"Support triage"}'
 
 # Versions are immutable — this appends v1 rather than editing anything
-curl -X POST localhost:8000/projects/demo/prompts/support-triage/versions \
+lo -X POST localhost:8000/projects/demo/prompts/support-triage/versions \
   -H 'content-type: application/json' \
   -d '{"messages":[{"role":"system","content":"You are terse."},
                    {"role":"user","content":"{{ question }}"}],
@@ -178,16 +218,16 @@ curl -X POST localhost:8000/projects/demo/prompts/support-triage/versions \
 # clear error instead of once per example, mid-run.
 
 # Promote it. Idempotent, so a retried deploy is safe.
-curl -X PUT localhost:8000/projects/demo/prompts/support-triage/labels/production \
+lo -X PUT localhost:8000/projects/demo/prompts/support-triage/labels/production \
   -H 'content-type: application/json' -d '{"version":1}'
 
 # Render by label, exactly as the eval runner and SDK will
-curl -X POST localhost:8000/projects/demo/prompts/support-triage/versions/production/render \
+lo -X POST localhost:8000/projects/demo/prompts/support-triage/versions/production/render \
   -H 'content-type: application/json' \
   -d '{"variables":{"question":"Where is my order?"}}'
 
 # After adding a v2: what am I about to ship?
-curl 'localhost:8000/projects/demo/prompts/support-triage/diff?from=production&to=2'
+lo 'localhost:8000/projects/demo/prompts/support-triage/diff?from=production&to=2'
 ```
 
 ### Running an eval
@@ -196,18 +236,18 @@ curl 'localhost:8000/projects/demo/prompts/support-triage/diff?from=production&t
 # A dataset (CSV or JSON; every non-reserved column becomes a template variable)
 printf 'question,answer\nWhere is my order?,Shipped\nWhen will it arrive?,Tuesday\n' > /tmp/qa.csv
 
-curl -X POST localhost:8000/projects/demo/datasets \
+lo -X POST localhost:8000/projects/demo/datasets \
   -H 'content-type: application/json' \
   -d '{"slug":"support-qa","name":"Support QA"}'
 
-curl -X POST localhost:8000/projects/demo/datasets/support-qa/versions/upload \
+lo -X POST localhost:8000/projects/demo/datasets/support-qa/versions/upload \
   -F file=@/tmp/qa.csv
 
 # What can I score with?
-curl -s localhost:8000/evaluators | jq '.[].type'
+lo localhost:8000/evaluators | jq '.[].type'
 
 # Start a run. Returns 202 + a run id; the worker executes it.
-curl -X POST localhost:8000/projects/demo/eval/runs \
+lo -X POST localhost:8000/projects/demo/eval/runs \
   -H 'content-type: application/json' \
   -d '{"dataset":"support-qa",
        "prompt":"support-triage","prompt_version":"production",
@@ -216,10 +256,10 @@ curl -X POST localhost:8000/projects/demo/eval/runs \
        "generation_provider":"fake"}'
 
 # Poll for progress and per-example results
-curl -s localhost:8000/projects/demo/eval/runs/<run-id> | jq '{status, aggregate_scores}'
+lo localhost:8000/projects/demo/eval/runs/<run-id> | jq '{status, aggregate_scores}'
 
 # Jobs that exhausted their retries
-curl -s localhost:8000/dead-letters
+lo localhost:8000/dead-letters
 ```
 
 `generation_provider` defaults to `fake` — deterministic, free, no API key — so
@@ -231,14 +271,14 @@ the whole flow above runs offline. Set `LO_ANTHROPIC_API_KEY` and pass
 ```bash
 # Install the built-in rubrics as versioned judge prompts in this project.
 # Idempotent: a rubric you have already edited is never overwritten.
-curl -X POST localhost:8000/projects/demo/judges/seed | jq '.[].slug'
+lo -X POST localhost:8000/projects/demo/judges/seed | jq '.[].slug'
 # judge-correctness  judge-faithfulness  judge-relevance  judge-toxicity
 
 # A rubric is an ordinary prompt — diff it, version it, promote it
-curl -s localhost:8000/projects/demo/prompts/judge-faithfulness/versions | jq '.[0].version'
+lo localhost:8000/projects/demo/prompts/judge-faithfulness/versions | jq '.[0].version'
 
 # Run with a judge and retrieval metrics together
-curl -X POST localhost:8000/projects/demo/eval/runs \
+lo -X POST localhost:8000/projects/demo/eval/runs \
   -H 'content-type: application/json' \
   -d '{"dataset":"support-qa","prompt":"support-triage","prompt_version":"production",
        "evaluators":[
@@ -248,7 +288,7 @@ curl -X POST localhost:8000/projects/demo/eval/runs \
        "generation_provider":"fake","judge_model":"claude-opus-5"}'
 
 # Did this change make things worse?
-curl -s 'localhost:8000/projects/demo/eval/compare?baseline=<run-a>&candidate=<run-b>' \
+lo 'localhost:8000/projects/demo/eval/compare?baseline=<run-a>&candidate=<run-b>' \
   | jq '{regressed: .regressed_count, improved: .improved_count,
          warnings, evaluators: [.evaluators[] | {evaluator, delta, change}]}'
 ```
@@ -268,8 +308,9 @@ They need no model call, so they are cheap enough to gate every commit on.
 Issue a key, then instrument in three lines:
 
 ```bash
-curl -X POST localhost:8000/projects/demo/api-keys \
-  -H 'content-type: application/json' -d '{"name":"my-app"}' | jq -r .key
+lo -X POST localhost:8000/projects/demo/api-keys \
+  -H 'content-type: application/json' \
+  -d '{"name":"my-app","scopes":["ingest"]}' | jq -r .key
 # lo_live_...  <- shown once, never retrievable again
 ```
 
@@ -295,8 +336,8 @@ def answer(question: str) -> str:
 Then read the tree back:
 
 ```bash
-curl -s localhost:8000/projects/demo/traces | jq '.[0]'
-curl -s localhost:8000/projects/demo/traces/<trace-id> | jq '.root'
+lo localhost:8000/projects/demo/traces | jq '.[0]'
+lo localhost:8000/projects/demo/traces/<trace-id> | jq '.root'
 ```
 
 **The SDK cannot break your application.** Bounded queue, background daemon
@@ -326,7 +367,7 @@ key stays server-side. That is why CORS is only opened for localhost.
 ### Alerting
 
 ```bash
-curl -X POST localhost:8000/projects/demo/alerts \
+lo -X POST localhost:8000/projects/demo/alerts \
   -H 'content-type: application/json' \
   -d '{"name":"high error rate","metric":"error_rate","comparison":"above",
        "threshold":0.05,"window_seconds":300,"min_sample_size":5,
@@ -348,7 +389,7 @@ Turn production failures into eval examples:
 
 ```bash
 # 1. Enable sampling. 10% of traffic, plus 5% of clean traces as a control.
-curl -X PUT localhost:8000/projects/demo/guardrails \
+lo -X PUT localhost:8000/projects/demo/guardrails \
   -H 'content-type: application/json' \
   -d '{"enabled":true,"sample_rate":0.1,"control_sample_rate":0.05}'
 
@@ -356,16 +397,16 @@ curl -X PUT localhost:8000/projects/demo/guardrails \
 #    checks — PII regex, a grounding heuristic, and a toxicity wordlist.
 
 # 3. Look at what got flagged, worst first.
-curl -s localhost:8000/projects/demo/review | jq '.[] | {output, findings}'
+lo localhost:8000/projects/demo/review | jq '.[] | {output, findings}'
 
 # 4. Label it, supplying the answer it should have given.
-curl -X POST localhost:8000/projects/demo/review/<id>/label \
+lo -X POST localhost:8000/projects/demo/review/<id>/label \
   -H 'content-type: application/json' \
   -d '{"verdict":"bad","reason":"hallucinated_price",
        "corrected_output":"I do not have pricing for that item."}'
 
 # 5. Promote a batch into a dataset. One promotion, one new version.
-curl -X POST localhost:8000/projects/demo/review/promote \
+lo -X POST localhost:8000/projects/demo/review/promote \
   -H 'content-type: application/json' \
   -d '{"item_ids":["<id>"],"dataset":"qa"}'
 ```
@@ -430,7 +471,7 @@ These are the rules the codebase actually enforces, not aspirations:
 | 5 | Tracing SDK, ingest API, nested spans | ✅ Done |
 | 6 | Observability dashboard + alerting | ✅ Done |
 | 7 | Guardrail sampling, review queue, labelling flywheel | ✅ Done |
-| 8 | API keys per project, auth across all endpoints | partial (ingest done) |
+| 8 | API keys per project, auth across all endpoints | ✅ Done |
 | 9 | Kubernetes manifests, Terraform for GCP | |
 | 10 | CD with plan → manual approval → apply | |
 
@@ -445,3 +486,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0007 — Tracing: spans, ingestion, the SDK contract](docs/adr/0007-tracing-and-ingestion.md)
 - [ADR 0008 — Dashboard metrics, the BFF, and alerting](docs/adr/0008-dashboard-and-alerting.md)
 - [ADR 0009 — Guardrail sampling and the data flywheel](docs/adr/0009-guardrails-and-the-flywheel.md)
+- [ADR 0010 — Authentication and authorisation](docs/adr/0010-authentication-and-authorisation.md)

@@ -13,7 +13,10 @@
 import "server-only";
 
 const API_BASE = process.env.LO_API_BASE_URL ?? "http://localhost:8000";
-const API_KEY = process.env.LO_PLATFORM_API_KEY;
+// The platform operator token — the same LO_ADMIN_TOKEN the API validates.
+// It lives here, on the server, and never reaches the browser: that is the
+// entire point of the BFF boundary (ADR 0008).
+const API_KEY = process.env.LO_ADMIN_TOKEN;
 
 export class ApiError extends Error {
   constructor(

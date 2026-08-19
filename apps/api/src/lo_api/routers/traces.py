@@ -17,8 +17,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Path, Query, Response, status
 
-from lo_api.dependencies import CurrentProject, DbSession, IngestKey
-from lo_core.errors import RateLimitError
+from lo_api.dependencies import CurrentProject, DbSession, IngestPrincipal
+from lo_core.errors import ForbiddenError, RateLimitError
 from lo_core.ratelimit import check_rate_limit
 from lo_core.schemas.telemetry import (
     TraceDetail,
@@ -44,7 +44,7 @@ DEFAULT_WINDOW = timedelta(hours=24)
 )
 async def ingest(
     payload: TraceIngestRequest,
-    key: IngestKey,
+    principal: IngestPrincipal,
     session: DbSession,
     response: Response,
 ) -> TraceIngestResponse:
@@ -58,10 +58,16 @@ async def ingest(
     cannot write into a project it does not hold a key for, which is the whole
     reason this endpoint authenticates rather than taking a project slug.
     """
+    # The admin token can ingest on behalf of any project, but it carries no
+    # project of its own — so ingestion genuinely requires a project key.
+    if principal.key is None:
+        raise ForbiddenError("trace ingestion requires a project API key, not the admin token")
+    project_id = principal.key.project_id
+
     # Cost is the span count, not one per request. Otherwise a client could send
     # 500-span batches a thousand times a minute and stay under a request-count
     # limit while writing half a million rows.
-    limit = await check_rate_limit(key.project_id, cost=len(payload.spans))
+    limit = await check_rate_limit(project_id, cost=len(payload.spans))
     response.headers["X-RateLimit-Limit"] = str(limit.limit)
     response.headers["X-RateLimit-Remaining"] = str(limit.remaining)
     if not limit.allowed:
@@ -70,7 +76,7 @@ async def ingest(
             retry_after=limit.retry_after,
         )
 
-    return await service.ingest_spans(session, key.project_id, payload.spans)
+    return await service.ingest_spans(session, project_id, payload.spans)
 
 
 @router.get(

@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Path, Query, status
 
-from lo_api.dependencies import CurrentProject, DbSession
+from lo_api.dependencies import AdminPrincipal, CurrentPrincipal, CurrentProject, DbSession
 from lo_api.queue import enqueue
 from lo_core.evaluators.registry import EvaluatorInfo, available
 from lo_core.schemas.evaluation import (
@@ -34,7 +34,7 @@ RunId = Annotated[uuid.UUID, Path(description="Eval run id")]
     response_model=list[EvaluatorInfo],
     summary="List available evaluators and their config schemas",
 )
-async def list_evaluators() -> list[EvaluatorInfo]:
+async def list_evaluators(_: CurrentPrincipal) -> list[EvaluatorInfo]:
     """Discovery endpoint.
 
     Returns each evaluator's JSON Schema so the UI can render a config form
@@ -180,6 +180,7 @@ async def list_judges(project: CurrentProject, session: DbSession) -> list[Promp
 )
 async def list_dead_letters(
     session: DbSession,
+    _: AdminPrincipal,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[DeadLetterRead]:

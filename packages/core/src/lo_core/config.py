@@ -58,6 +58,22 @@ class Settings(BaseSettings):
         description="Set from a secrets manager in every non-local environment.",
     )
 
+    # The platform operator credential.
+    #
+    # Distinct from a project API key, and deliberately so. A project key is
+    # issued *to* a tenant and is scoped to their data; this one belongs to
+    # whoever runs the platform, creates projects, and mints those keys. It is
+    # what the dashboard's server side holds — which is why the browser never
+    # sees it (ADR 0008).
+    #
+    # Generated into .env by `make bootstrap` so local development is not a
+    # choice between "no auth" and "friction". Required in every deployed
+    # environment: without it, project creation would have no gate at all.
+    admin_token: SecretStr | None = Field(
+        default=None,
+        description="Platform operator token. Creates projects and issues project keys.",
+    )
+
     # --- Provider credentials (optional until Phase 3) --------------------
     anthropic_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None
@@ -87,6 +103,12 @@ class Settings(BaseSettings):
         problems: list[str] = []
         if self.api_key_pepper.get_secret_value() == INSECURE_DEV_PEPPER:
             problems.append("LO_API_KEY_PEPPER is still the built-in development default")
+        if self.admin_token is None:
+            problems.append(
+                "LO_ADMIN_TOKEN is unset — project creation and key issuance would be ungated"
+            )
+        elif len(self.admin_token.get_secret_value()) < 32:
+            problems.append("LO_ADMIN_TOKEN is shorter than 32 characters")
         if self.database_echo:
             problems.append("LO_DATABASE_ECHO=true leaks query parameters into logs")
         if problems:

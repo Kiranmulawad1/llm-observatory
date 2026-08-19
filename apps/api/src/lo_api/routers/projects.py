@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, status
 
-from lo_api.dependencies import CurrentProject, DbSession
+from lo_api.dependencies import AdminPrincipal, CurrentProject, DbSession
 from lo_core.schemas.prompt import ProjectCreate, ProjectRead
 from lo_core.services import projects as service
 
@@ -21,13 +21,15 @@ router = APIRouter(prefix="/projects", tags=["projects"])
     status_code=status.HTTP_201_CREATED,
     summary="Create a project",
 )
-async def create_project(payload: ProjectCreate, session: DbSession) -> ProjectRead:
+async def create_project(
+    payload: ProjectCreate, session: DbSession, _: AdminPrincipal
+) -> ProjectRead:
     project = await service.create_project(session, payload)
     return ProjectRead.model_validate(project)
 
 
 @router.get("", response_model=list[ProjectRead], summary="List projects")
-async def list_projects(session: DbSession) -> list[ProjectRead]:
+async def list_projects(session: DbSession, _: AdminPrincipal) -> list[ProjectRead]:
     return [ProjectRead.model_validate(p) for p in await service.list_projects(session)]
 
 

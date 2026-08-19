@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Path, status
 
-from lo_api.dependencies import CurrentProject, DbSession
+from lo_api.dependencies import CurrentProject, DbSession, ProjectAdmin
 from lo_core.schemas.telemetry import ApiKeyCreate, ApiKeyCreated, ApiKeyRead
 from lo_core.services import api_keys as service
 
@@ -24,6 +24,7 @@ async def create_api_key(
     payload: ApiKeyCreate,
     project: CurrentProject,
     session: DbSession,
+    _: ProjectAdmin,
 ) -> ApiKeyCreated:
     """Issue a key. **The plaintext is returned once and never again.**
 
@@ -43,7 +44,9 @@ async def create_api_key(
 
 
 @router.get("", response_model=list[ApiKeyRead], summary="List API keys")
-async def list_api_keys(project: CurrentProject, session: DbSession) -> list[ApiKeyRead]:
+async def list_api_keys(
+    project: CurrentProject, session: DbSession, _: ProjectAdmin
+) -> list[ApiKeyRead]:
     """List keys. Returns metadata and the clear prefix — never the key itself."""
     keys = await service.list_api_keys(session, project.id)
     return [ApiKeyRead.model_validate(k) for k in keys]
@@ -58,6 +61,7 @@ async def revoke_api_key(
     key_id: Annotated[uuid.UUID, Path()],
     project: CurrentProject,
     session: DbSession,
+    _: ProjectAdmin,
 ) -> ApiKeyRead:
     """Revoke by stamping `revoked_at`, rather than deleting the row.
 

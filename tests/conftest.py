@@ -23,6 +23,9 @@ from sqlalchemy.pool import NullPool
 
 os.environ.setdefault("LO_ENVIRONMENT", "local")
 os.environ.setdefault("LO_API_KEY_PEPPER", "test-pepper")
+# The platform operator token. Tests drive the API as the operator unless a
+# test deliberately presents a project key instead.
+os.environ.setdefault("LO_ADMIN_TOKEN", "test-admin-token-at-least-32-chars-long")
 
 # LO_DATABASE_URL and LO_REDIS_URL are deliberately *not* defaulted here.
 #
@@ -130,6 +133,17 @@ async def committed_project() -> AsyncIterator[uuid.UUID]:
     from lo_core.schemas.prompt import ProjectCreate
     from lo_core.services import projects as project_service
 
+    # Dispose before use, not only after.
+    #
+    # This fixture uses the module-global engine (the runner and sampler need
+    # their own sessions, so they cannot join the test transaction). pytest-asyncio
+    # builds a fresh event loop per test, while the global engine's pool survives
+    # across tests — so a pooled connection created on a previous test's loop gets
+    # handed to this one, and asyncpg raises "attached to a different loop" from
+    # somewhere far away from the cause. Starting from a disposed pool guarantees
+    # every connection belongs to the loop currently running.
+    await dispose_engine()
+
     slug = f"runner-{uuid.uuid4().hex[:10]}"
     async with session_scope() as session:
         project = await project_service.create_project(
@@ -193,5 +207,11 @@ async def client(db_connection: AsyncConnection) -> AsyncIterator[httpx.AsyncCli
     app.dependency_overrides[db_session_dependency] = _override
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        # Authenticated as the operator by default. A test that cares about
+        # authorisation overrides the header on the individual request.
+        headers={"Authorization": f"Bearer {os.environ['LO_ADMIN_TOKEN']}"},
+    ) as http_client:
         yield http_client

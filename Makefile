@@ -7,6 +7,17 @@ help: ## Show available targets
 
 bootstrap: ## First-time setup: .env, Python deps, web deps
 	@test -f .env || (cp .env.example .env && echo "created .env from .env.example")
+	@# Generate a local operator token if .env does not have one. Auth is
+	@# enforced in every environment including local — the alternative is a
+	@# dev-only bypass that eventually ships.
+	@grep -q '^LO_ADMIN_TOKEN=.\+' .env || ( \
+		TOKEN=$$(python3 -c "import secrets; print(secrets.token_urlsafe(32))"); \
+		if grep -q '^LO_ADMIN_TOKEN=' .env; then \
+			sed -i.bak "s|^LO_ADMIN_TOKEN=.*|LO_ADMIN_TOKEN=$$TOKEN|" .env && rm -f .env.bak; \
+		else \
+			printf "\nLO_ADMIN_TOKEN=%s\n" "$$TOKEN" >> .env; \
+		fi; \
+		echo "generated LO_ADMIN_TOKEN in .env" )
 	uv sync --all-packages
 	cd apps/web && npm install
 

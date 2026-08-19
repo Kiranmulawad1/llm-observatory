@@ -911,8 +911,8 @@ The trap is describing *features*. Describe **decisions and their consequences**
 | 5 | Tracing SDK, ingest API, nested spans | ✅ |
 | 6 | Observability dashboard (Next.js) + alerting | ✅ |
 | 7 | Guardrail sampling, review queue, flywheel | ✅ |
-| 8 | API keys per project, auth everywhere | next (ingest already done) |
-| 9 | Kubernetes manifests, Terraform for GCP | |
+| 8 | API keys per project, auth everywhere | ✅ |
+| 9 | Kubernetes manifests, Terraform for GCP | next |
 | 10 | CI/CD with plan → approve → apply | |
 
 **Phase 5 is a real shift.** Everything so far writes to the `control` schema:
@@ -1831,7 +1831,286 @@ returns **409** — it's already frozen into a dataset version.
 
 ---
 
-## 13. Where to look when you're stuck
+## 13. Phase 8 — auth, explained
+
+### The hole this closed
+
+Until this phase, exactly one endpoint checked a credential: `POST /v1/traces`.
+Everything else — prompts, datasets, eval runs, judges, alert rules, the review
+queue — answered anyone who could reach port 8000.
+
+That is worse than it sounds, because the data model has been multi-tenant
+since Phase 2. Every table carries a `project_id`. The database was carefully
+built so that project A's rows and project B's rows never mix... and then the
+API let anyone type `/projects/b/prompts` and read them anyway. The isolation
+existed in the schema and nowhere else.
+
+### Two kinds of caller, and why they can't be the same thing
+
+Think about who actually talks to this platform:
+
+**An instrumented application.** It runs on someone else's servers. It holds a
+project API key that you issued. It writes spans, thousands per minute, and
+that is all it should ever do.
+
+**You, the operator.** You create projects. You issue those keys. You look at
+any project's data when someone reports a problem.
+
+Here is the question that decides the design: *which project key can create
+project keys?* None of them — that's circular. The first key for a new project
+has to be minted by something that isn't a project key. So there are two
+credential types, and they aren't a hierarchy:
+
+| | `LO_ADMIN_TOKEN` | project key (`lo_live_…`) |
+| --- | --- | --- |
+| lives in | config (`.env`, a secrets manager) | the `control.api_keys` table, hashed |
+| scoped to | the whole platform | exactly one project |
+| creates keys | yes | no |
+| ingests spans | **no** | yes, with the `ingest` scope |
+
+That last row surprises people. Read on.
+
+### The `Principal`: one identity, resolved once
+
+Both credentials arrive the same way — `Authorization: Bearer <something>` —
+and one function turns that string into an identity:
+
+```python
+@dataclass(frozen=True)
+class Principal:
+    is_admin: bool = False
+    key: ApiKey | None = None
+    scopes: frozenset[str] = frozenset()
+```
+
+Frozen, because an identity that a handler can mutate mid-request is a bug
+waiting to happen. `is_admin=True` means the operator token matched; otherwise
+`key` names which project you are, and `scopes` says what you may do there.
+
+No route ever touches the raw header. There is one place in the codebase where
+bytes become an identity, so there is one place to audit — and one place a
+future mistake could live, instead of forty.
+
+### The important bit: tenancy is a dependency, not a check
+
+Look at [`resolve_project`](apps/api/src/lo_api/dependencies.py). Any route that
+needs a project asks for `CurrentProject`, and that dependency does three
+things before the handler runs:
+
+1. Look up the project by slug.
+2. If this is a project key, refuse unless `key.project_id` matches.
+3. Require `read` for GET/HEAD/OPTIONS, `write` for everything else.
+
+Now compare against the obvious alternative — writing the ownership check
+inside each handler:
+
+```python
+# The design that produces CVEs
+async def get_prompts(project_slug, principal, session):
+    project = await get_project_by_slug(session, project_slug)
+    if principal.key.project_id != project.id:   # forget this line once...
+        raise ForbiddenError(...)
+```
+
+That version **fails open**. Add a router in Phase 11, forget the check, and
+that router is public. Nothing tells you. The tests still pass, because you
+didn't write a test for a check you didn't remember to write.
+
+The dependency version **fails closed**. A handler cannot get a `Project`
+object without going through the check — that's the only way to obtain one. To
+write an insecure handler you'd have to actively bypass `CurrentProject` and
+query the database yourself, which is a visible, deliberate act in code review,
+not an omission.
+
+This is the whole idea behind *IDOR* (Insecure Direct Object Reference), the
+vulnerability class where `/invoices/1234` happily shows you someone else's
+invoice. Almost every real instance of it is a forgotten check, not a wrong
+one. The fix is structural: make it impossible to forget.
+
+And there's a test that makes the structure self-enforcing:
+
+```python
+# tests/integration/test_auth.py
+for path, methods in app.openapi()["paths"].items():
+    if "{project_slug}" not in path:
+        continue
+    # ...call it with no credential
+    assert response.status_code == 401
+assert checked > 25
+```
+
+It walks the **live OpenAPI schema**. A router you add next month is covered
+the moment you register it, with no test to remember to write. That's the same
+trick as the dependency, applied to the test suite.
+
+### Why a wrong project returns 404, not 403
+
+```
+GET /projects/acme-corp/prompts   with a key for project "demo"
+```
+
+The honest answer is "you're not allowed". The answer the API gives is "no such
+project".
+
+Why lie? Because 403 confirms `acme-corp` exists. Try `netflix`, `stripe`,
+`openai` — the ones that 403 are real customers, the ones that 404 aren't. You
+have handed an attacker a free list of your tenants without them ever reading a
+row. That's an *enumeration oracle*, and the fix is to make "forbidden" and
+"nonexistent" indistinguishable from outside.
+
+Missing scope on a project you *do* own still returns 403, because you already
+know it exists — there's nothing left to leak.
+
+### Scopes, and the one that's deliberately awkward
+
+Four scopes: `ingest`, `read`, `write`, `admin`.
+
+```python
+IMPLIED_SCOPES = {
+    SCOPE_ADMIN: frozenset({SCOPE_READ, SCOPE_WRITE}),
+}
+```
+
+`admin` implies read and write. This came from a real bug during the build: a
+key with `["read", "admin"]` was refused a POST, because it lacked literal
+`write`. Correct by the letter, nonsense in practice — a project administrator
+who cannot write to its own project isn't an administrator.
+
+But notice what's *not* in that dict. `ingest` is implied by nothing, not even
+`admin`. The operator token, which can do everything else in the platform, gets
+a 403 from `POST /v1/traces`:
+
+```
+admin tok  -> POST /v1/traces                  403
+```
+
+That's intentional, and it's the most interesting decision in the phase.
+Ingestion is the only capability you hand to code running on machines you don't
+control. It's the credential most likely to leak — it ships inside customer
+applications, gets committed to their repos, ends up in their logs. So the
+blast radius should run in exactly one direction: an ingest key can write spans
+and read nothing, and nothing else can write spans.
+
+If `admin` implied `ingest`, then a leaked operator token could forge telemetry
+into any project — fabricate a clean trace history, hide an incident, poison
+the review queue that feeds your labelled dataset. Keeping the scopes disjoint
+means telemetry is always attributable to a specific issued key you can revoke.
+
+### Why the operator token isn't a database row
+
+`LO_ADMIN_TOKEN` is settings, not a table. That's a deliberate asymmetry: the
+credential that can create credentials shouldn't be stored in the thing it
+protects. If your database leaks, the attacker gets hashes of project keys —
+useless — and no operator token at all, because it was never in there.
+
+`assert_production_safe()` refuses to boot outside `local` without one of at
+least 32 characters. And `make bootstrap` generates one locally with
+`secrets.token_urlsafe(32)`, so **development is authenticated too**.
+
+That last point is worth defending, because the tempting alternative is
+`if settings.environment == "local": skip_auth()`. Don't. Every dev-only
+bypass is one misconfigured environment variable away from being a production
+bypass, and it means your local testing never exercises the code path that
+actually runs in production. The tests take the same medicine: the `client`
+fixture sends the operator token by default, so a test about authorisation has
+to opt *out* explicitly rather than passing by accident because auth was off.
+
+### Constant-time comparison, one more time
+
+```python
+hmac.compare_digest(candidate, expected)
+```
+
+Not `==`. A normal string comparison returns as soon as two bytes differ, so
+"wrong at character 1" takes measurably less time than "wrong at character 30".
+Feed enough requests through and that timing difference reconstructs the token
+one character at a time. `compare_digest` always looks at everything.
+
+Same reason the API-key hash is SHA-256 + a server-side pepper rather than
+bcrypt: the key is 256 bits of CSPRNG output, so there's nothing to brute-force
+by guessing, and it's checked on the hottest path in the system. Pepper, not
+salt-per-row, because the pepper lives in config — so a stolen database dump
+alone can't be attacked offline. (The moment any *human-chosen* password enters
+this system, that reasoning inverts and it must be Argon2id.)
+
+### What to test by hand
+
+```bash
+export LO_ADMIN_TOKEN=$(grep '^LO_ADMIN_TOKEN=' .env | cut -d= -f2)
+make api
+
+# 1. Nothing works without a credential.
+curl -i -X POST localhost:8000/projects -d '{"slug":"x","name":"x"}'   # 401
+curl -i localhost:8000/projects/demo/prompts                           # 401
+
+# 2. Probes stay open — they have to, they can't hold secrets.
+curl -i localhost:8000/healthz                                         # 200
+
+# 3. As the operator.
+lo() { curl -s -H "Authorization: Bearer $LO_ADMIN_TOKEN" "$@"; }
+lo -X POST localhost:8000/projects -H 'content-type: application/json' \
+   -d '{"slug":"demo","name":"Demo"}'                                  # 201
+
+# 4. Mint a read-only key and watch it hit its ceiling.
+READ=$(lo -X POST localhost:8000/projects/demo/api-keys \
+  -H 'content-type: application/json' \
+  -d '{"name":"ro","scopes":["read"]}' | jq -r .key)
+
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/projects/demo/prompts \
+  -H "Authorization: Bearer $READ"                                     # 200
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/projects/demo/prompts \
+  -H "Authorization: Bearer $READ" -H 'content-type: application/json' \
+  -d '{"slug":"p","name":"P"}'                                         # 403
+
+# 5. Cross-tenant: create a second project, then ask for it with demo's key.
+lo -X POST localhost:8000/projects -H 'content-type: application/json' \
+   -d '{"slug":"other","name":"Other"}'
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/projects/other/prompts \
+  -H "Authorization: Bearer $READ"                                     # 404, not 403
+
+# 6. The operator token cannot ingest.
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/v1/traces \
+  -H "Authorization: Bearer $LO_ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"spans":[]}'                                                    # 403
+```
+
+Then open http://localhost:3000. The dashboard still works, and the browser
+never receives a credential — the Next.js server holds `LO_ADMIN_TOKEN` and
+proxies. Open devtools, look at the network tab: requests go to `/api/proxy/…`
+on your own origin, with no `Authorization` header anywhere. That's the BFF
+pattern from Phase 6 paying off; if the browser held the token, every user of
+the dashboard would have a platform-operator credential sitting in JavaScript.
+
+### Simplifications, and what production adds
+
+- **No human identity.** A shared operator token can't tell you *who* did
+  something. Production fronts this with OIDC and issues short-lived per-user
+  tokens so the audit log names a person.
+- **No audit log at all.** There should be a `control.audit_events` row for
+  every mutating request: principal, method, path, timestamp.
+- **Revocation is instant, with no overlap.** Real rotation needs two valid
+  keys per project during a changeover window.
+- **Four scopes, not roles.** The moment "can approve review items" and "can
+  edit alert rules" need to differ per person, this becomes a role table.
+- **No per-key rate limits.** Rate limiting is per project; a noisy key can
+  starve a well-behaved one in the same project.
+
+### How this reads on a résumé
+
+Not "added authentication". The story is:
+
+> Enforced multi-tenant isolation at a single dependency-injection choke point
+> rather than per-handler, so new endpoints are secure by default; verified it
+> with a test that walks the live OpenAPI schema and asserts every
+> project-scoped route rejects anonymous requests.
+
+The distinction between *a check you wrote everywhere* and *a check that can't
+be omitted* is the difference between someone who has used auth middleware and
+someone who has thought about why IDOR keeps happening to everyone else.
+
+---
+
+## 14. Where to look when you're stuck
 
 - **Why was this done this way?** → `docs/adr/` — one file per decision, each
   with the alternatives I rejected and why.
