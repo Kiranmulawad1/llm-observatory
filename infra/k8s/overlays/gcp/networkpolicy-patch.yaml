@@ -1,0 +1,59 @@
+# Redis is Memorystore in GCP, so it is not a pod and no podSelector can match
+# it. The base policy's egress rule to `app.kubernetes.io/name: lo-redis`
+# therefore matches nothing here, and without this the API and worker cannot
+# reach the queue at all.
+#
+# The CIDR below is a syntactically valid stand-in, not a real range. Replace
+# it with the private-services block Terraform allocated
+# (`google_compute_global_address.private_service_range`), inside which
+# Memorystore lives. A /16 rather than the instance address, because the
+# address is assigned at creation and changes if the instance is rebuilt.
+#
+# Kept valid rather than a PLACEHOLDER token so `kubeconform` still checks this
+# file — an unparseable CIDR would be skipped by validation and only fail at
+# apply time.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-api
+spec:
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-postgres
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:
+        - ipBlock:
+            cidr: 10.100.0.0/16 # replace: Terraform PSA range
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-worker
+spec:
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-postgres
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:
+        - ipBlock:
+            cidr: 10.100.0.0/16 # replace: Terraform PSA range
+      ports:
+        - { protocol: TCP, port: 6379 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }

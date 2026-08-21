@@ -61,7 +61,8 @@ version upgrades and PVC resizing all become ours. "Run your database on
 Kubernetes" is rightly treated as an anti-pattern *when a managed option
 exists*; here one does not for this workload.
 
-Redis is the counter-example and is deliberately managed (Memorystore,
+Because both environments run it, the StatefulSet lives in `base/` and the
+overlays only patch its disk and resources. Redis is the counter-example and is deliberately managed (Memorystore,
 `STANDARD_HA`): nothing forces our hand, so managed wins. The principle is
 **managed where managed works, self-hosted only where a hard technical
 constraint forces it** — not a blanket preference in either direction.
@@ -140,6 +141,16 @@ web tier has no route to Postgres at all: the BFF is an architectural boundary
 from Phase 6, and this is the network enforcing what the code already promises.
 Worker egress excludes RFC1918 and `169.254.0.0/16` — the metadata server hands
 node credentials to anything that asks.
+
+**A connection needs two policies to permit it**, not one: egress on the source
+pod *and* ingress on the destination. They are evaluated independently. This
+project shipped the classic version of that mistake — egress rules from
+api/worker/migrate to the database, and no ingress rule on the database — and
+the symptom is maximally misleading: Postgres `Running` and healthy,
+`pg_isready` passing inside the pod, and every client timing out. Manifest
+schema validation cannot catch it, because every field is valid. Only a cluster
+that actually enforces NetworkPolicy can, which is the reason `kind-e2e` exists
+in CI rather than schema validation alone.
 
 ## What is actually executed, and what is not
 

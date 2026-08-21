@@ -158,3 +158,61 @@ spec:
               app.kubernetes.io/name: lo-postgres
       ports:
         - { protocol: TCP, port: 5432 }
+---
+# Ingress on the datastores. Do not delete this thinking the egress rules
+# above already cover it.
+#
+# A connection has to be permitted by *two* policies: egress on the source pod
+# and ingress on the destination pod. They are evaluated independently and both
+# must allow. Writing only the egress half is the single most common
+# NetworkPolicy mistake, and it fails in the most confusing possible way — the
+# database pod is Running and healthy, `pg_isready` passes inside it, and every
+# client times out.
+#
+# This project shipped exactly that bug: the manifests were schema-valid, they
+# applied cleanly, and Postgres came up fine. It was only caught by a cluster
+# that actually enforces NetworkPolicy, which is why kind-e2e exists in CI.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-postgres
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lo-postgres
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                # Note who is absent: lo-web. The BFF boundary says the web
+                # tier talks to the API and never to the database, and this is
+                # the network refusing to allow otherwise.
+                values: [lo-api, lo-worker, lo-migrate]
+      ports:
+        - { protocol: TCP, port: 5432 }
+  # No egress rules. The database initiates nothing outbound; DNS is granted
+  # separately by allow-dns, which selects every pod.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-redis
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lo-redis
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                # The API enqueues jobs and rate-limits ingest; the worker
+                # consumes. Migrations never touch Redis.
+                values: [lo-api, lo-worker]
+      ports:
+        - { protocol: TCP, port: 6379 }

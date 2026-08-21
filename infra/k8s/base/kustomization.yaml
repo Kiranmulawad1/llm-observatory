@@ -21,9 +21,18 @@ resources:
   - worker-deployment.yaml
   - web-deployment.yaml
   - web-service.yaml
+  - postgres.yaml
   - migrate-job.yaml
   - pdb.yaml
   - networkpolicy.yaml
+
+configMapGenerator:
+  # Extensions and schemas, applied once when the data volume is first created.
+  # Table DDL is Alembic's job — see infra/docker/postgres-init/01-init.sql,
+  # which this is a copy of so that compose and Kubernetes bootstrap identically.
+  - name: lo-postgres-init
+    files:
+      - 01-init.sql=postgres-init.sql
 
 # Image tags are set by the overlay, never edited here. `kustomize edit set
 # image` in CI rewrites these to a digest, which is the only reference that

@@ -1,0 +1,34 @@
+# Production sizing for the self-hosted TimescaleDB StatefulSet.
+#
+# It is in base rather than an overlay because both environments run it — see
+# ADR 0011 for why Cloud SQL is not an option here. What differs is the disk
+# and the resources, which is exactly what an overlay is for.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lo-postgres
+spec:
+  template:
+    spec:
+      containers:
+        - name: postgres
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              # No CPU limit, same reasoning as the application pods: throttling
+              # a database mid-query produces latency nobody can attribute.
+              memory: 12Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # SSD, not the default balanced disk. Hypertable inserts are
+        # append-heavy and the queries behind the dashboard are scans over
+        # recent chunks; both are IOPS-bound.
+        storageClassName: premium-rwo
+        resources:
+          requests:
+            storage: 200Gi

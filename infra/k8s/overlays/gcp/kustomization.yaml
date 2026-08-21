@@ -12,6 +12,12 @@ resources:
 patches:
   - path: resources-patch.yaml
   - path: service-patch.yaml
+  - path: postgres-patch.yaml
+  # A multi-document patch: each document matches its resource by kind and
+  # name. `egress` carries no patchMergeKey, so a strategic merge replaces the
+  # rule list wholesale rather than merging it positionally — which is what we
+  # want, since these rules describe a different topology, not an addition.
+  - path: networkpolicy-patch.yaml
 
 configMapGenerator:
   - name: lo-config

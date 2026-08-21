@@ -167,6 +167,24 @@ jobs:
           kubectl: "1.32.0"
           kubeconform: "0.6.7"
 
+      # The kind overlay's secretGenerator reads secrets.env, which is
+      # gitignored by design (ADR 0011: a credential is never a committed
+      # file). It therefore does not exist in a CI checkout, and without it
+      # `kubectl kustomize` cannot render the overlay at all. Synthesise a
+      # throwaway one with the same keys: rendering only needs the keys to
+      # exist, and these values never leave the runner. The file stays
+      # untracked, so the "Reject committed Secret manifests" gate below is
+      # unaffected.
+      - name: Synthesise a throwaway secrets.env for rendering
+        run: |
+          cat > infra/k8s/overlays/kind/secrets.env <<'EOF'
+          POSTGRES_PASSWORD=ci-render-only
+          LO_DATABASE_URL=postgresql+asyncpg://lo:ci-render-only@postgres:5432/llm_observatory
+          LO_REDIS_URL=redis://redis:6379/0
+          LO_API_KEY_PEPPER=ci-render-only
+          LO_ADMIN_TOKEN=ci-render-only
+          EOF
+
       - name: Render and validate every overlay
         run: |
           set -euo pipefail

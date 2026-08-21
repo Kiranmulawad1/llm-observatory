@@ -2285,7 +2285,22 @@ Then each allow rule opens exactly one path. The ordering matters
 conceptually: without the default-deny first, the allow rules are decoration,
 because everything was already permitted.
 
-Two details I would point at in a review:
+**The rule that actually bites you: both ends must agree.** A connection is
+allowed only if the *source* pod's egress permits it AND the *destination*
+pod's ingress permits it. Two separate policies, evaluated independently.
+
+Writing only the egress half is the most common NetworkPolicy mistake, and this
+project shipped it. The manifests were schema-valid. They applied cleanly.
+Postgres came up `Running` and healthy, and `pg_isready` passed *inside* the
+pod. Every client just timed out, and the API sat at `0/1 Ready` with a 503
+from `/readyz` — which looks like a broken application, not a firewall.
+
+Nothing short of a cluster that enforces NetworkPolicy will find that. It is
+the reason CI stands up a real `kind` cluster instead of trusting
+`kubeconform`: schema validation proves your YAML is well-formed, not that your
+architecture works.
+
+Two more details I would point at in a review:
 
 **The web tier cannot reach Postgres.** Not "does not" — *cannot*. The BFF
 boundary from Phase 6 said the browser must never hold a credential and the

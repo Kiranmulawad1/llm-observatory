@@ -5,7 +5,9 @@ namespace: llm-observatory
 
 resources:
   - ../../base
-  - postgres.yaml
+  # Redis only. Postgres lives in base because *both* environments self-host it
+  # — Cloud SQL cannot load the timescaledb extension (ADR 0011). Redis is the
+  # one that genuinely differs: managed Memorystore in GCP, a StatefulSet here.
   - redis.yaml
 
 patches:
@@ -13,9 +15,6 @@ patches:
   - path: scale-down-patch.yaml
 
 configMapGenerator:
-  - name: lo-postgres-init
-    files:
-      - 01-init.sql=postgres-init.sql
   # Point the applications at the in-cluster database and Redis. This merges
   # into the base ConfigMap rather than replacing it.
   - name: lo-config
