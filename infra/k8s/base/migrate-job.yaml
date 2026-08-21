@@ -35,6 +35,58 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: lo-migrate
+      initContainers:
+        # Wait for Postgres to accept TCP connections before running Alembic.
+        #
+        # Without this the Job starts at the same instant as the StatefulSet
+        # and loses a race against `initdb`, which takes tens of seconds on a
+        # fresh volume. It recovers — that is what backoffLimit is for — but it
+        # burns retries on a startup ordering problem rather than keeping them
+        # for a genuine transient fault, and a slightly slower Postgres
+        # exhausts them and fails the deploy.
+        #
+        # A plain TCP check is the right signal here: during `initdb` the
+        # official image runs a temporary server bound only to a Unix socket,
+        # so the port does not answer until the real server is up.
+        - name: wait-for-postgres
+          image: llm-observatory/api:dev
+          command:
+            - python
+            - -c
+            - |
+              import os, socket, sys, time
+              from urllib.parse import urlsplit
+
+              url = urlsplit(os.environ["LO_DATABASE_URL"])
+              host, port = url.hostname, url.port or 5432
+              deadline = time.monotonic() + 180
+
+              while time.monotonic() < deadline:
+                  try:
+                      with socket.create_connection((host, port), timeout=3):
+                          print(f"{host}:{port} is accepting connections")
+                          sys.exit(0)
+                  except OSError as exc:
+                      print(f"waiting for {host}:{port}: {exc}", flush=True)
+                      time.sleep(2)
+
+              # Fail loudly rather than letting Alembic produce a connection
+              # traceback that buries the actual cause.
+              sys.exit(f"{host}:{port} did not accept connections within 180s")
+          envFrom:
+            - secretRef:
+                name: lo-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
