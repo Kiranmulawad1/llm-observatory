@@ -288,7 +288,21 @@ jobs:
         run: |
           kubectl get pods -n llm-observatory -o wide
           kubectl describe pods -n llm-observatory
-          kubectl logs -n llm-observatory -l app.kubernetes.io/part-of=llm-observatory --all-containers --tail=200
+          # The migration Job explicitly, and first.
+          #
+          # `kubectl logs -l <selector>` skips pods that have already
+          # terminated, which is precisely the state a failed Job is in — so
+          # the run that mattered came back with pod descriptions and no
+          # actual error message. Ask for the Job's pods by name instead.
+          for pod in $(kubectl get pods -n llm-observatory \
+                        -l app.kubernetes.io/name=lo-migrate \
+                        -o name 2>/dev/null); do
+            echo "::group::logs $pod"
+            kubectl logs -n llm-observatory "$pod" --tail=200 || true
+            echo "::endgroup::"
+          done
+          kubectl logs -n llm-observatory -l app.kubernetes.io/part-of=llm-observatory \
+            --all-containers --prefix --tail=200 --ignore-errors || true
 
   images:
     name: Build images

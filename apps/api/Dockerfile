@@ -26,6 +26,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY packages/core packages/core
 COPY apps/api apps/api
 
+# Migrations ship inside the API image.
+#
+# The `lo-migrate` Job runs `alembic upgrade head` from this image rather than
+# a separate one, so that the schema and the code that expects it are built
+# from the same commit and cannot drift. That only works if the migration
+# scripts are actually here: alembic.ini sets `script_location = migrations`,
+# and without both of these `alembic upgrade head` exits with a config error
+# before it ever opens a connection.
+COPY alembic.ini alembic.ini
+COPY migrations migrations
+
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --package lo-api
 
