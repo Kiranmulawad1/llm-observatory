@@ -152,6 +152,13 @@ schema validation cannot catch it, because every field is valid. Only a cluster
 that actually enforces NetworkPolicy can, which is the reason `kind-e2e` exists
 in CI rather than schema validation alone.
 
+The same run then exposed the corollary: **external traffic does not come from
+a pod.** NodePort connections are SNAT'd to the node address, and cloud load
+balancers arrive from the provider's health-check ranges. A policy expressed
+purely in `podSelector` terms therefore drops every request from outside while
+every in-cluster path stays healthy. Base declares only the in-cluster rules;
+each overlay supplies the `ipBlock` for its own environment.
+
 ## What is actually executed, and what is not
 
 | | executed? | how |

@@ -11,6 +11,7 @@ resources:
   - redis.yaml
 
 patches:
+  - path: networkpolicy-patch.yaml
   - path: nodeport-patch.yaml
   - path: scale-down-patch.yaml
 

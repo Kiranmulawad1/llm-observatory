@@ -2300,6 +2300,20 @@ the reason CI stands up a real `kind` cluster instead of trusting
 `kubeconform`: schema validation proves your YAML is well-formed, not that your
 architecture works.
 
+**And the corollary, which bit immediately afterwards: traffic from outside
+the cluster is not from a pod.** A NodePort connection is source-NAT'd to the
+node's own address before it reaches your container. A cloud load balancer
+arrives from the provider's health-check range. Neither is a pod, so no
+`podSelector` will ever match them, and a policy written entirely in terms of
+pods silently drops every external request.
+
+The symptom, again, is misleading: every pod `Running`, every pod `Ready`,
+service-to-service traffic fine — and `curl` from your laptop returns
+`connection reset by peer`. The source differs per environment
+(`172.18.0.0/16` for kind's Docker bridge; `130.211.0.0/22` and
+`35.191.0.0/16` for Google's front ends), which is why base declares only the
+in-cluster rules and each overlay adds its own `ipBlock`.
+
 Two more details I would point at in a review:
 
 **The web tier cannot reach Postgres.** Not "does not" — *cannot*. The BFF

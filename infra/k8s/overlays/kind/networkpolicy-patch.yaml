@@ -1,0 +1,39 @@
+# Allow the NodePort traffic that `kind-cluster.yaml` maps to the host.
+#
+# A NodePort connection is source-NAT'd to the node's own address before it
+# reaches the pod, so from the pod's point of view the client is 172.18.0.2 —
+# the kind node on Docker's default bridge network — and not any pod at all.
+# `from: podSelector` can never match it.
+#
+# This is why `curl localhost:30800/healthz` returned "connection reset by
+# peer" while every pod in the cluster was Running and Ready: default-deny was
+# dropping the packet at the very last hop.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-api
+spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-web
+        - ipBlock:
+            # Docker's default bridge range, which is where kind puts its
+            # nodes. Broad, and acceptable for a laptop cluster that is not
+            # reachable from anywhere else.
+            cidr: 172.18.0.0/16
+      ports:
+        - { protocol: TCP, port: 8000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-web
+spec:
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 172.18.0.0/16
+      ports:
+        - { protocol: TCP, port: 3000 }

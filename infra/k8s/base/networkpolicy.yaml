@@ -44,20 +44,23 @@ spec:
       app.kubernetes.io/name: lo-api
   policyTypes: [Ingress, Egress]
   ingress:
-    # From the web frontend (dashboard traffic)...
+    # In-cluster traffic only: the web frontend calling the API.
+    #
+    # Traffic entering from *outside* the cluster is not covered here and
+    # cannot be, because it does not arrive from a pod. A NodePort or a cloud
+    # load balancer SNATs the packet to a node address or to the provider's
+    # health-check range, so no `podSelector` will ever match it — the source
+    # differs per environment, so each overlay adds its own `ipBlock`:
+    #
+    #   kind  the node's Docker network (see overlays/kind)
+    #   gcp   Google's load balancer and health check ranges (see overlays/gcp)
+    #
+    # Getting this wrong presents as `connection reset by peer` from outside
+    # while everything inside the cluster is perfectly healthy.
     - from:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: lo-web
-      ports:
-        - { protocol: TCP, port: 8000 }
-    # ...and from the ingress controller, which is what carries SDK span
-    # ingestion in from outside the cluster.
-    - from:
-        - namespaceSelector: {}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/component: ingress-controller
       ports:
         - { protocol: TCP, port: 8000 }
   egress:
@@ -83,14 +86,9 @@ spec:
     matchLabels:
       app.kubernetes.io/name: lo-web
   policyTypes: [Ingress, Egress]
-  ingress:
-    - from:
-        - namespaceSelector: {}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/component: ingress-controller
-      ports:
-        - { protocol: TCP, port: 3000 }
+  # No ingress rules in base: nothing inside the cluster calls the web tier.
+  # Its only callers are browsers, which arrive from outside and are therefore
+  # granted by the per-environment overlay. See the note on lo-api above.
   egress:
     # The web tier reaches the API and nothing else. In particular it has no
     # route to Postgres — the BFF is an architectural boundary, and this is the

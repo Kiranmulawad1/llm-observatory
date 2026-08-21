@@ -17,6 +17,23 @@ kind: NetworkPolicy
 metadata:
   name: lo-api
 spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-web
+        # Google Front End and health-check ranges. Traffic from a Google
+        # load balancer — including the health check that decides whether a
+        # backend is serving — originates here, not from a pod. These two
+        # CIDRs are fixed and documented by Google; without them the load
+        # balancer marks every backend unhealthy and serves 502s while the
+        # pods themselves are perfectly fine.
+        - ipBlock:
+            cidr: 130.211.0.0/22
+        - ipBlock:
+            cidr: 35.191.0.0/16
+      ports:
+        - { protocol: TCP, port: 8000 }
   egress:
     - to:
         - podSelector:
@@ -57,3 +74,24 @@ spec:
               - 169.254.0.0/16
       ports:
         - { protocol: TCP, port: 443 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lo-web
+spec:
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 130.211.0.0/22
+        - ipBlock:
+            cidr: 35.191.0.0/16
+      ports:
+        - { protocol: TCP, port: 3000 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lo-api
+      ports:
+        - { protocol: TCP, port: 8000 }
