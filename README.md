@@ -345,6 +345,30 @@ thread, drop-and-count on overflow, never raises into the caller, and completely
 inert when `LO_API_KEY` is unset. Point it at a dead endpoint and your code runs
 exactly as before — there is a test that asserts precisely that.
 
+### Already using OpenTelemetry?
+
+Then you do not need the SDK above. An application instrumented with
+OpenTelemetry — directly, or via OpenLLMetry, Logfire, or a Collector — points
+here with two environment variables and no code change:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8000/otlp
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer lo_live_..."
+```
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` is a base URL that exporters append `/v1/traces`
+to, which is why the collector-compatible endpoint lives under `/otlp` rather
+than fighting the native SDK for `/v1/traces`. Both protobuf and JSON are
+accepted, because protobuf is what the OTel SDKs send by default.
+
+The GenAI semantic conventions are mapped onto the same span model the native
+SDK writes to — tokens, model, cost and operation kind become real columns, and
+anything unrecognised is kept in `metadata` rather than dropped. Three
+generations of attribute spelling are read (`gen_ai.usage.input_tokens`, the
+older `gen_ai.usage.prompt_tokens`, and OpenLLMetry's `llm.usage.prompt_tokens`)
+so you do not have to match your instrumentation to ours. See
+[ADR 0012](docs/adr/0012-otlp-ingest.md).
+
 ### The dashboard
 
 ```bash
@@ -537,3 +561,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0009 — Guardrail sampling and the data flywheel](docs/adr/0009-guardrails-and-the-flywheel.md)
 - [ADR 0010 — Authentication and authorisation](docs/adr/0010-authentication-and-authorisation.md)
 - [ADR 0011 — Deployment topology: containers, Kubernetes, GCP](docs/adr/0011-deployment-topology.md)
+- [ADR 0012 — OTLP ingest and the GenAI semantic conventions](docs/adr/0012-otlp-ingest.md)

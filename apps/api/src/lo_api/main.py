@@ -17,6 +17,7 @@ from lo_api.routers import (
     evaluation,
     health,
     metrics,
+    otlp,
     projects,
     prompts,
     review,
@@ -83,6 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(evaluation.router)
     app.include_router(api_keys.router)
     app.include_router(traces.router)
+    app.include_router(otlp.router)
     app.include_router(metrics.router)
     app.include_router(review.router)
 

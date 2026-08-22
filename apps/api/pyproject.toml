@@ -10,6 +10,10 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
     "arq>=0.26",
+    # OTLP ingest. Lives here rather than in `core` because OTLP is a wire
+    # protocol, and ADR 0001 keeps `core` to the domain — the worker has no
+    # business decoding protobuf, and each image installs only its own closure.
+    "opentelemetry-proto>=1.29",
 ]
 
 [tool.uv.sources]

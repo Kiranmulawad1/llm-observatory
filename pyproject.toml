@@ -32,6 +32,8 @@ dev = [
     # rather than treating every call as Any.
     "types-jsonschema>=4.23",
     "types-regex>=2024.11",
+    # Stubs for the generated OTLP protobuf modules (OTLP ingest, ADR 0012).
+    "types-protobuf>=5.29",
 ]
 
 [tool.uv.sources.lo-api]
