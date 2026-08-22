@@ -615,6 +615,46 @@ file, in production the External Secrets Operator materialises it from GCP
 Secret Manager, and Terraform creates the secret *containers* but never a
 version — because a value passed to Terraform is a value in state.
 
+### Continuous delivery
+
+`.github/workflows/cd.yml`:
+
+```
+build → push by digest → terraform plan → ⏸ human approval → apply → migrate → roll out
+```
+
+**The approval is never granted here.** There is no GCP account behind this
+repository, so the pipeline is written as if there were and stops at its own
+gate. Everything before the gate is real: the workflow is linted by `actionlint`
+in CI on every PR, the images are built by the same Dockerfiles, and the digest
+pinning is verified.
+
+Two details are the point of the whole thing:
+
+**The plan artifact is what gets applied.** `terraform plan -out=tfplan` writes
+the exact changes to a file; the reviewer reads it in the job summary; the apply
+job runs `terraform apply tfplan` against *that file*. Approving and then running
+a bare `terraform apply` would re-plan against whatever state exists at approval
+time — so the reviewer approves one thing and the pipeline applies another.
+Terraform refuses a stale saved plan, so it is enforced rather than hoped for.
+
+**Deploys go by digest, never by tag.** A tag can be re-pointed at different
+bytes after the review that approved it; a digest cannot.
+
+Rollback is deliberately asymmetric: a failed rollout runs `kubectl rollout
+undo`, a failed apply does not get reverted. Terraform has no undo, and
+reverting infrastructure means a new plan reviewed in the other direction —
+generating one automatically during an incident is the worst moment to skip
+the gate.
+
+To enable it on a fork, set the repository variables `GCP_PROJECT_ID`,
+`GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_DEPLOYER_SERVICE_ACCOUNT`, `GCP_REGION`
+and `GCP_TFSTATE_BUCKET` (the last four are Terraform outputs), then create a
+`production` environment with required reviewers. **Without that environment
+there is no gate** — the pipeline applies without asking. Unset variables make
+every deploy job skip cleanly rather than fail, so an unconfigured checkout
+stays green. See [ADR 0016](docs/adr/0016-continuous-delivery.md).
+
 ### Migrations
 
 ```bash
@@ -665,7 +705,7 @@ These are the rules the codebase actually enforces, not aspirations:
 | 7 | Guardrail sampling, review queue, labelling flywheel | ✅ Done |
 | 8 | API keys per project, auth across all endpoints | ✅ Done |
 | 9 | Kubernetes manifests, Terraform for GCP | ✅ Done |
-| 10 | CD with plan → manual approval → apply | next |
+| 10 | CD with plan → manual approval → apply | ✅ Done |
 
 ## Decisions
 
@@ -684,3 +724,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0013 — One adapter for every OpenAI-compatible endpoint](docs/adr/0013-openai-compatible-provider.md)
 - [ADR 0014 — Self-observability and the cardinality line](docs/adr/0014-self-observability.md)
 - [ADR 0015 — Measuring ingest throughput](docs/adr/0015-load-benchmark.md)
+- [ADR 0016 — Continuous delivery and the approval gate](docs/adr/0016-continuous-delivery.md)

@@ -133,6 +133,22 @@ jobs:
       - run: npm run lint
       - run: npm run build
 
+  workflows:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The CD pipeline is never executed in this project — there is no cloud
+      # account behind it — so a typo in it would otherwise sit undiscovered
+      # until somebody forked the repo and pointed it at a real project.
+      # actionlint parses the workflow, type-checks every expression, and
+      # shellchecks the `run:` blocks, which is most of what a dry run would
+      # have caught.
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
   infra:
     name: Infrastructure validation
     runs-on: ubuntu-latest

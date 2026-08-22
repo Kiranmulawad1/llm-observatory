@@ -1,0 +1,327 @@
+# Continuous delivery: build → push by digest → plan → **human approval** → apply → roll out.
+#
+# ---------------------------------------------------------------------------
+# THE APPROVAL IS NEVER GRANTED IN THIS PROJECT.
+#
+# There is no GCP account and no billing behind this repository, so `plan` has
+# nothing to plan against and `apply` never runs. The pipeline is written as if
+# it did, because the shape of it — what is gated, what is immutable, what is
+# reviewed — is the part worth getting right, and it is not something you can
+# retrofit onto a pipeline that was built to deploy straight from main.
+#
+# Everything up to the gate is real, exercised code: the workflow lints clean
+# under actionlint, the image build is the same one CI runs, and the digest
+# rewrite is tested. See ADR 0016.
+# ---------------------------------------------------------------------------
+name: CD
+
+on:
+  push:
+    branches: [main]
+  # So a deploy can be re-run without an empty commit — the usual reason
+  # somebody pushes "retrigger ci" to a production branch.
+  workflow_dispatch:
+
+# Serialise deploys. Deliberately NOT cancel-in-progress: cancelling a
+# `terraform apply` half way through leaves state describing infrastructure that
+# no longer matches reality, which is materially worse than waiting.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Is this repository configured to deploy anywhere at all?
+  #
+  # Without this, every push to main would show a red X for missing credentials
+  # that are missing on purpose. A skipped job renders grey and says "not
+  # configured", which is the truth. It also means somebody who forks this and
+  # *does* have a GCP project only has to set two variables.
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: Deployment configured?
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        run: |
+          if [ -n "$PROJECT_ID" ] && [ -n "$WIF_PROVIDER" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No deployment target configured. Set the repository " \
+                 "variables GCP_PROJECT_ID and GCP_WORKLOAD_IDENTITY_PROVIDER to enable CD."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Build and push, recording the digest.
+  #
+  # The digest is the deployable identity, not the tag. A tag can be re-pointed
+  # at different bytes after the review that approved it; a digest cannot. The
+  # registry is configured with immutable tags too (Terraform, modules/registry),
+  # so this is belt and braces — but the belt is the one that matters, because
+  # the manifests reference the digest.
+  # ---------------------------------------------------------------------------
+  images:
+    name: Build and push images
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for Workload Identity Federation: the runner mints an OIDC
+      # token that GCP exchanges for a short-lived credential. No service
+      # account key exists, so there is nothing in repository secrets to leak
+      # and nothing to rotate.
+      id-token: write
+    outputs:
+      api: ${{ steps.digests.outputs.api }}
+      worker: ${{ steps.digests.outputs.worker }}
+      web: ${{ steps.digests.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Authenticate Docker to Artifact Registry
+        run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: digests
+        name: Build, push, and record digests
+        env:
+          REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/llm-observatory
+        run: |
+          set -euo pipefail
+          build() {
+            name="$1"; dockerfile="$2"; context="$3"
+            image="$REGISTRY/$name"
+            docker buildx build \
+              --file "$dockerfile" \
+              --tag "$image:${GITHUB_SHA}" \
+              --cache-from "type=gha,scope=$name" \
+              --cache-to "type=gha,mode=max,scope=$name" \
+              --push "$context"
+            # Resolve tag -> digest once, here, and pass the digest onward. The
+            # tag exists for humans reading the registry; nothing deploys by it.
+            digest=$(docker buildx imagetools inspect "$image:${GITHUB_SHA}" \
+              --format '{{.Manifest.Digest}}')
+            echo "$name=$image@$digest" >> "$GITHUB_OUTPUT"
+          }
+          build api    apps/api/Dockerfile    .
+          build worker apps/worker/Dockerfile .
+          build web    apps/web/Dockerfile    ./apps/web
+
+  # ---------------------------------------------------------------------------
+  # Plan, and save the plan.
+  #
+  # `-out` is the whole point. The artifact uploaded here is the exact set of
+  # changes a human reads and approves, and the apply job applies *that file*.
+  # A bare `terraform apply` after the gate would re-plan against whatever the
+  # state looks like at approval time, which may not be what was reviewed —
+  # turning the approval into theatre.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Terraform plan
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Init
+        run: |
+          terraform -chdir=infra/terraform init \
+            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}" \
+            -backend-config="prefix=llm-observatory/prod"
+
+      - name: Plan
+        id: plan
+        run: |
+          terraform -chdir=infra/terraform plan \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="region=${{ vars.GCP_REGION }}" \
+            -detailed-exitcode -out=tfplan || exitcode=$?
+          # -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error. Without
+          # it a plan that failed and a plan with nothing to do are the same
+          # exit code, and the pipeline would happily "approve" an error.
+          case "${exitcode:-0}" in
+            0) echo "changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) exit "${exitcode}"   ;;
+          esac
+
+      - name: Render the plan for a human to read
+        run: |
+          terraform -chdir=infra/terraform show -no-color tfplan \
+            | tee "$GITHUB_STEP_SUMMARY"
+
+      # The plan file records every attribute of every resource, including ones
+      # marked sensitive — it is not a diff, it is a state document. Short
+      # retention, and it never leaves this repository's runners.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: infra/terraform/tfplan
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # THE GATE.
+  #
+  # `environment: production` is what makes this block. Configure required
+  # reviewers on that environment in repository settings; until somebody
+  # approves, this job sits pending and nothing below it runs.
+  #
+  # A GitHub Environment is the right mechanism rather than a third-party
+  # "wait for approval" action, which simulates the same thing by opening an
+  # issue and polling it. Environments are free on public repositories, record
+  # who approved what against the deployment, and cannot be bypassed by
+  # re-running a single job.
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Apply (requires approval)
+    needs: [preflight, plan, images]
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ vars.PUBLIC_HOSTNAME }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: infra/terraform
+
+      - name: Init
+        run: |
+          terraform -chdir=infra/terraform init \
+            -backend-config="bucket=${{ vars.GCP_TFSTATE_BUCKET }}" \
+            -backend-config="prefix=llm-observatory/prod"
+
+      # The saved plan, not a fresh one. Terraform refuses to apply a plan file
+      # whose state has moved on since it was created, which is the property
+      # that makes the approval mean something: what was reviewed is what runs,
+      # or nothing runs.
+      - name: Apply the approved plan
+        run: terraform -chdir=infra/terraform apply -input=false tfplan
+
+  # ---------------------------------------------------------------------------
+  # Roll out the application.
+  #
+  # Separate from `apply` because the two fail for unrelated reasons and at
+  # unrelated frequencies: infrastructure changes rarely, images change every
+  # merge. Keeping them in one job would mean a failed rollout looks like a
+  # failed infrastructure change.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Roll out to the cluster
+    needs: [preflight, apply, images]
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ vars.PUBLIC_HOSTNAME }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: llm-observatory
+          location: ${{ vars.GCP_REGION }}
+
+      - uses: yokawasa/action-setup-kube-tools@v0.11.2
+        with:
+          kubectl: "1.32.0"
+          kustomize: "5.5.0"
+
+      - name: Pin the manifests to the built digests
+        working-directory: infra/k8s/overlays/gcp
+        run: |
+          set -euo pipefail
+          kustomize edit set image "llm-observatory/api=${{ needs.images.outputs.api }}"
+          kustomize edit set image "llm-observatory/worker=${{ needs.images.outputs.worker }}"
+          kustomize edit set image "llm-observatory/web=${{ needs.images.outputs.web }}"
+
+      # Migrations first, then the rollout, and the wait is what enforces it —
+      # `kubectl apply -k` does not order resources, so without this the new
+      # code can start against a schema that has not been migrated (ADR 0011).
+      - name: Migrate, then roll out
+        run: |
+          set -euo pipefail
+          kubectl delete job lo-migrate -n llm-observatory --ignore-not-found
+          kubectl apply -k infra/k8s/overlays/gcp
+          kubectl wait --for=condition=complete job/lo-migrate \
+            -n llm-observatory --timeout=600s
+          for deployment in lo-api lo-worker lo-web; do
+            kubectl rollout status "deployment/$deployment" \
+              -n llm-observatory --timeout=600s
+          done
+
+      # `rollout status` already fails on a stalled rollout, so this is about
+      # the case it cannot see: pods that pass their probes and still serve
+      # wrong. Failing here undoes the deploy rather than leaving it half-live.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          kubectl run smoke --rm -i --restart=Never --image=curlimages/curl:8.11.1 \
+            -n llm-observatory --quiet -- \
+            sh -c 'curl -fsS http://lo-api:8000/healthz && curl -fsS http://lo-api:8000/readyz'
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          for deployment in lo-api lo-worker lo-web; do
+            kubectl rollout undo "deployment/$deployment" -n llm-observatory || true
+          done
+          echo "::error::Rollout failed and was rolled back. Infrastructure changes from " \
+               "the apply step are NOT reverted — Terraform has no undo, and a rollback " \
+               "would need its own reviewed plan."

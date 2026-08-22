@@ -913,7 +913,7 @@ The trap is describing *features*. Describe **decisions and their consequences**
 | 7 | Guardrail sampling, review queue, flywheel | ✅ |
 | 8 | API keys per project, auth everywhere | ✅ |
 | 9 | Kubernetes manifests, Terraform for GCP | ✅ |
-| 10 | CI/CD with plan → approve → apply | next |
+| 10 | CI/CD with plan → approve → apply | ✅ |
 
 **Phase 5 is a real shift.** Everything so far writes to the `control` schema:
 low volume, transactional, foreign keys everywhere. Traces are the opposite —
