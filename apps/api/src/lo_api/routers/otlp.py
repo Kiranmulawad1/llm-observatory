@@ -34,7 +34,7 @@ from fastapi import APIRouter, Request, Response, status
 from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
 
 from lo_api.dependencies import DbSession, IngestPrincipal
-from lo_api.otlp import decode_json, decode_protobuf, to_span_ingest
+from lo_api.otlp import decode_json, decode_protobuf, decompress, to_span_ingest
 from lo_core.errors import ForbiddenError, RateLimitError, ValidationError
 from lo_core.ratelimit import check_rate_limit
 from lo_core.schemas.telemetry import MAX_SPANS_PER_BATCH
@@ -77,8 +77,12 @@ async def export_traces(
     project_id = principal.key.project_id
 
     body = await request.body()
+    # Checked against the wire bytes, before decompression. `decompress` applies
+    # its own, separate ceiling to what those bytes expand into.
     if len(body) > MAX_BODY_BYTES:
         raise ValidationError(f"OTLP payload exceeds {MAX_BODY_BYTES} bytes")
+
+    body = decompress(body, request.headers.get("content-encoding", ""))
 
     # Content-Type may carry parameters (`application/json; charset=utf-8`).
     content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()

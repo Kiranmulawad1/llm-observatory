@@ -97,6 +97,27 @@ cannot be confused with one on the span. An unrecognised convention degrades to
 "still searchable" rather than "silently dropped" — which matters because the
 conventions will keep moving.
 
+### gzip, decompressed with a ceiling
+
+Exporters commonly compress: the Collector's `otlphttp` exporter enables gzip by
+default, and language SDKs do when `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` is set.
+Nothing in the ASGI stack decompresses, so without handling it the compressed
+bytes reach the protobuf parser and come back as "malformed payload" — an error
+that points at the wrong thing and fails before any mapping runs. It is the most
+likely first contact a real user has with this endpoint.
+
+The part worth arguing about is the **ceiling on the decompressed size**, which
+is separate from the request-size limit. That limit applies to bytes on the
+wire, and for a compressed body those say nothing about what they become in
+memory — gzip reaches roughly 1000:1 on repetitive input, so a 4 MiB request can
+expand to gigabytes. Decompression is therefore incremental and capped at 16 MiB
+rather than a single `gzip.decompress`, which allocates whatever the stream
+expands to.
+
+Authentication is not a defence against this. An ingest key is, by design, held
+by code running on someone else's infrastructure, and a misconfigured client
+trips a decompression bomb as easily as an attacker sets one.
+
 ### Partial success rather than rejection
 
 Spans that cannot be mapped are counted into `partialSuccess.rejectedSpans` and
@@ -133,8 +154,9 @@ not.
 - **Protobuf over gRPC.** `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is the other half
   of OTLP and is what most Collector deployments speak internally. HTTP first
   because it traverses proxies and needs no second port.
-- **Compression.** Exporters send `Content-Encoding: gzip` by default over gRPC
-  and optionally over HTTP; this endpoint does not yet decompress.
+- **Other compression schemes.** gzip is handled; the Collector can also be
+  configured for zstd and snappy, which are not in the OTLP/HTTP spec but do
+  appear in the wild.
 - **Metrics and logs.** `/v1/metrics` and `/v1/logs` are the same shape of
   problem. Traces first, because they are what this platform is about.
 - **A dead-letter path for rejected spans.** They are counted today; the ones

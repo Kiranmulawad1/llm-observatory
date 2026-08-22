@@ -375,6 +375,9 @@ to, which is why the collector-compatible endpoint lives under `/otlp` rather
 than fighting the native SDK for `/v1/traces`. Both protobuf and JSON are
 accepted, because protobuf is what the OTel SDKs send by default.
 
+`Content-Encoding: gzip` is handled, which the Collector's `otlphttp` exporter
+enables by default.
+
 **OTLP/HTTP only — `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is not supported.** It is
 the default in several language SDKs, and pointing a gRPC exporter here means
 nothing arrives with no obvious reason why, so set the protocol explicitly if

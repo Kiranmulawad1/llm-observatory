@@ -433,3 +433,82 @@ class TestJsonDecoding:
 
     def test_empty_export_decodes_to_nothing(self) -> None:
         assert decode_json(b'{"resourceSpans": []}') == []
+
+
+class TestDecompression:
+    """`Content-Encoding: gzip`, which OTLP exporters commonly enable.
+
+    Nothing in ASGI decompresses for us, so without this the compressed bytes
+    reach the protobuf parser and surface as "malformed payload" — an error
+    pointing at the wrong thing entirely.
+    """
+
+    def test_identity_and_absent_pass_through(self) -> None:
+        from lo_api.otlp import decompress
+
+        assert decompress(b"raw bytes", "") == b"raw bytes"
+        assert decompress(b"raw bytes", "identity") == b"raw bytes"
+
+    def test_gzip_round_trips(self) -> None:
+        import gzip
+
+        from lo_api.otlp import decompress
+
+        payload = build_protobuf_request()
+        assert decompress(gzip.compress(payload), "gzip") == payload
+
+    def test_header_case_and_whitespace_are_tolerated(self) -> None:
+        import gzip
+
+        from lo_api.otlp import decompress
+
+        assert decompress(gzip.compress(b"x"), " GZIP ") == b"x"
+
+    def test_unknown_encoding_names_what_is_supported(self) -> None:
+        from lo_api.otlp import decompress
+
+        with pytest.raises(ValidationError, match="gzip or identity"):
+            decompress(b"...", "br")
+
+    def test_malformed_gzip_is_a_validation_error(self) -> None:
+        from lo_api.otlp import decompress
+
+        with pytest.raises(ValidationError, match="malformed gzip"):
+            decompress(b"\x1f\x8b not really gzip", "gzip")
+
+    def test_truncated_stream_says_so(self) -> None:
+        import gzip
+
+        from lo_api.otlp import decompress
+
+        truncated = gzip.compress(b"a" * 5000)[:-40]
+        with pytest.raises(ValidationError, match="truncated"):
+            decompress(truncated, "gzip")
+
+    def test_decompression_bomb_is_refused(self) -> None:
+        """A small request must not be allowed to become a large allocation.
+
+        The request-size limit applies to the bytes on the wire, which for a
+        compressed body says nothing about what they expand to. Authentication
+        is not a defence here: an ingest key runs on someone else's machine, and
+        a misconfigured client trips this as easily as an attacker.
+        """
+        import gzip
+
+        from lo_api.otlp import MAX_DECOMPRESSED_BYTES, decompress
+
+        bomb = gzip.compress(b"\0" * (MAX_DECOMPRESSED_BYTES + 1024))
+        # Small on the wire, far too large once expanded.
+        assert len(bomb) < 100_000
+
+        with pytest.raises(ValidationError, match="expands beyond"):
+            decompress(bomb, "gzip")
+
+    def test_payload_at_the_limit_still_decompresses(self) -> None:
+        """The bound must not reject a legitimate payload just under it."""
+        import gzip
+
+        from lo_api.otlp import MAX_DECOMPRESSED_BYTES, decompress
+
+        payload = b"\0" * (MAX_DECOMPRESSED_BYTES - 1)
+        assert len(decompress(gzip.compress(payload), "gzip")) == len(payload)

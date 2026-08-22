@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +35,27 @@ from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
 from opentelemetry.proto.common.v1 import common_pb2
 
 from lo_core.errors import ValidationError
+
+# Ceiling on the *decompressed* payload.
+#
+# The request-size limit applies to the bytes on the wire, which for a
+# compressed body says nothing about what it becomes in memory: gzip reaches
+# roughly 1000:1 on repetitive input, so a 4 MiB request can expand to
+# gigabytes. That is a decompression bomb, and an authenticated endpoint is not
+# a defence — a project key belongs to code running on someone else's
+# infrastructure, and a misconfigured client can do this by accident as easily
+# as an attacker can on purpose.
+#
+# 16 MiB is generous for the 500-span batch limit (roughly 32 KiB per span, with
+# prompt and completion text included) while bounding what one request can cost
+# a pod that has a 512 MiB memory limit. A client that trips it gets the same
+# advice as one that exceeds the span limit: send smaller batches.
+MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024
+
+# gzip's window size, offset to select the gzip wrapper rather than raw deflate.
+_GZIP_WBITS = 16 + zlib.MAX_WBITS
+
+SUPPORTED_ENCODINGS = frozenset({"", "identity", "gzip"})
 
 # W3C Trace Context sizes, in hex characters.
 TRACE_ID_HEX = 32
@@ -72,6 +94,49 @@ class OtlpSpan:
     # exists only on the wire.
     resource_attributes: dict[str, Any]
     scope_name: str | None
+
+
+def decompress(body: bytes, content_encoding: str) -> bytes:
+    """Undo `Content-Encoding`, with a bound on the result.
+
+    OTLP/HTTP exporters commonly enable gzip — the Collector's `otlphttp`
+    exporter does by default — and nothing in ASGI decompresses for us. Without
+    this the compressed bytes reach the protobuf parser, which reports a
+    malformed payload: a confusing error that points at the wrong thing and
+    fails before any of the mapping runs. It is the most likely first contact a
+    real user has with this endpoint.
+
+    Decompression is incremental and capped rather than a single
+    `gzip.decompress`, which would happily allocate whatever the stream
+    expands to.
+    """
+    encoding = content_encoding.strip().lower()
+    if encoding in ("", "identity"):
+        return body
+    if encoding != "gzip":
+        raise ValidationError(
+            f"unsupported Content-Encoding {encoding!r}; expected gzip or identity"
+        )
+
+    decompressor = zlib.decompressobj(_GZIP_WBITS)
+    try:
+        # max_length caps the output; anything left over stays in
+        # `unconsumed_tail` instead of being allocated.
+        decompressed = decompressor.decompress(body, MAX_DECOMPRESSED_BYTES)
+    except zlib.error as exc:
+        raise ValidationError(f"malformed gzip payload: {exc}") from exc
+
+    if decompressor.unconsumed_tail:
+        raise ValidationError(
+            f"gzip payload expands beyond {MAX_DECOMPRESSED_BYTES} bytes; "
+            "lower the exporter's batch size"
+        )
+    if not decompressor.eof:
+        # Input consumed but the stream never ended: a truncated body, which is
+        # a different fault from an oversized one and deserves its own message.
+        raise ValidationError("gzip payload is truncated")
+
+    return decompressed
 
 
 def _hex_from_bytes(raw: bytes) -> str:

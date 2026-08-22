@@ -9,6 +9,7 @@ in the wrong order still comes out right.
 
 from __future__ import annotations
 
+import gzip
 import json
 import uuid
 from typing import Any
@@ -437,3 +438,106 @@ class TestTenancyAndIdempotency:
 
         detail = (await client.get(f"/projects/{name}/traces/{trace_id}")).json()
         assert detail["span_count"] == 1
+
+
+class TestCompressedIngest:
+    """What a real exporter actually sends.
+
+    The OpenTelemetry Collector's `otlphttp` exporter enables gzip by default,
+    and several language SDKs do when `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` is
+    set. Nothing in the ASGI stack decompresses, so before this the compressed
+    bytes reached the protobuf parser and came back as "malformed payload" —
+    failing before any mapping ran, and blaming the wrong thing.
+    """
+
+    async def test_gzipped_protobuf_is_ingested(self, client: httpx.AsyncClient) -> None:
+        name, key = await make_project_with_key(client)
+        trace_id, span_id = hex_id(32), hex_id(16)
+
+        response = await client.post(
+            OTLP_PATH,
+            content=gzip.compress(
+                export_request(
+                    proto_span(
+                        trace_id=trace_id,
+                        span_id=span_id,
+                        name="chat",
+                        attributes={"gen_ai.usage.input_tokens": 42},
+                    )
+                )
+            ),
+            headers={
+                "content-type": PROTOBUF,
+                "content-encoding": "gzip",
+                "Authorization": f"Bearer {key}",
+            },
+        )
+        assert response.status_code == 200, response.text
+
+        root = (await client.get(f"/projects/{name}/traces/{trace_id}")).json()["root"]
+        assert root["span_id"] == span_id
+        assert root["prompt_tokens"] == 42
+
+    async def test_gzipped_json_is_ingested(self, client: httpx.AsyncClient) -> None:
+        name, key = await make_project_with_key(client)
+        trace_id, span_id = hex_id(32), hex_id(16)
+
+        payload = {
+            "resourceSpans": [
+                {
+                    "scopeSpans": [
+                        {
+                            "spans": [
+                                {
+                                    "traceId": trace_id,
+                                    "spanId": span_id,
+                                    "name": "chat",
+                                    "startTimeUnixNano": str(START_NS),
+                                    "endTimeUnixNano": str(START_NS + 1_000_000_000),
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+        response = await client.post(
+            OTLP_PATH,
+            content=gzip.compress(json.dumps(payload).encode()),
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+                "Authorization": f"Bearer {key}",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert (await client.get(f"/projects/{name}/traces/{trace_id}")).status_code == 200
+
+    async def test_unsupported_encoding_is_rejected_clearly(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """Not silently parsed as if it were uncompressed."""
+        _, key = await make_project_with_key(client)
+        response = await client.post(
+            OTLP_PATH,
+            content=b"whatever",
+            headers={
+                "content-type": PROTOBUF,
+                "content-encoding": "br",
+                "Authorization": f"Bearer {key}",
+            },
+        )
+        assert response.status_code == 422
+        assert "gzip" in response.text
+
+    async def test_uncompressed_still_works(self, client: httpx.AsyncClient) -> None:
+        """Compression is optional; absence of the header must change nothing."""
+        name, key = await make_project_with_key(client)
+        trace_id = hex_id(32)
+        response = await client.post(
+            OTLP_PATH,
+            content=export_request(proto_span(trace_id=trace_id, span_id=hex_id(16))),
+            headers={"content-type": PROTOBUF, "Authorization": f"Bearer {key}"},
+        )
+        assert response.status_code == 200
+        assert (await client.get(f"/projects/{name}/traces/{trace_id}")).status_code == 200
