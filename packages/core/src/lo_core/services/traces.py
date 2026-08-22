@@ -7,7 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -151,6 +151,37 @@ async def refresh_trace(session: AsyncSession, project_id: uuid.UUID, trace_id: 
         "trace_metadata": root.span_metadata if root is not None else {},
     }
 
+    # A rollup's `started_at` is MIN(span.started_at), and that value can move
+    # *earlier* when a span from before the current earliest arrives in a later
+    # batch — which is routine, because spans complete innermost-first while a
+    # batching exporter flushes on a timer.
+    #
+    # `started_at` is also part of the primary key, because Timescale requires
+    # the partitioning column in every unique index. So when the minimum moves,
+    # the upsert below no longer matches the existing row and inserts a *second*
+    # rollup for the same trace. Both rows then satisfy a lookup by trace_id,
+    # and the read path raises MultipleResultsFound — the trace becomes
+    # unreadable, which is a strange way for late data to present.
+    #
+    # Existing rows are therefore read first, so that the superseded ones can be
+    # removed after the write, and so that state which does not come from the
+    # spans survives being re-keyed.
+    existing = (
+        await session.execute(
+            select(Trace.started_at, Trace.flagged_at).where(
+                Trace.trace_id == trace_id, Trace.project_id == project_id
+            )
+        )
+    ).all()
+
+    # `flagged_at` is set by guardrail sampling, not derived from spans. If a
+    # flagged trace were re-keyed without carrying it, the trace would silently
+    # drop out of the human review queue — losing exactly the traces someone
+    # decided were worth looking at.
+    flagged_at = next((row.flagged_at for row in existing if row.flagged_at is not None), None)
+    if flagged_at is not None:
+        values["flagged_at"] = flagged_at
+
     stmt = pg_insert(Trace).values(values)
     await session.execute(
         stmt.on_conflict_do_update(
@@ -158,6 +189,17 @@ async def refresh_trace(session: AsyncSession, project_id: uuid.UUID, trace_id: 
             set_={k: v for k, v in values.items() if k not in ("started_at", "trace_id")},
         )
     )
+
+    # Insert first, then clear superseded rows, so the row just written is never
+    # the one deleted.
+    if any(row.started_at != aggregate.started_at for row in existing):
+        await session.execute(
+            delete(Trace).where(
+                Trace.trace_id == trace_id,
+                Trace.project_id == project_id,
+                Trace.started_at != aggregate.started_at,
+            )
+        )
 
 
 # --- Queries --------------------------------------------------------------

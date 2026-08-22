@@ -176,6 +176,42 @@ class TestIngest:
         # Counted rather than hidden, so a client with broken retries can see it.
         assert second["accepted"] == 0 and second["duplicates"] == 1
 
+    async def test_span_starting_earlier_than_the_rollup_does_not_duplicate_it(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """A trace's rollup is re-keyed when its earliest span moves earlier.
+
+        `traces.started_at` is MIN(span.started_at) and part of the primary key,
+        because Timescale requires the partitioning column in every unique
+        index. A span arriving later but *starting* earlier moves that minimum,
+        so the upsert no longer matches the existing row. Without cleanup that
+        writes a second rollup for one trace, and the read path then fails with
+        MultipleResultsFound — a trace made unreadable by late data.
+        """
+        project, key = await make_project_with_key(client)
+        headers = {"Authorization": f"Bearer {key}"}
+        trace_id, child_id, root_id = hex_id(32), hex_id(16), hex_id(16)
+
+        now = datetime.now(UTC)
+        child = span_payload(trace_id, child_id, parent_span_id=root_id, name="child")
+        child["started_at"] = now.isoformat()
+        root = span_payload(trace_id, root_id, name="answer_question")
+        root["started_at"] = (now - timedelta(seconds=5)).isoformat()
+
+        # Child first, then the root that began five seconds earlier.
+        for payload in (child, root):
+            response = await client.post("/v1/traces", json={"spans": [payload]}, headers=headers)
+            assert response.status_code == 202, response.text
+
+        listed = (await client.get(f"/projects/{project}/traces")).json()
+        assert len([t for t in listed if t["trace_id"] == trace_id]) == 1
+
+        detail = await client.get(f"/projects/{project}/traces/{trace_id}")
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+        assert body["span_count"] == 2
+        assert body["name"] == "answer_question"
+
     async def test_project_comes_from_the_key_not_the_body(self, client: httpx.AsyncClient) -> None:
         """A client cannot write into a project it holds no key for."""
         project_a, key_a = await make_project_with_key(client)
