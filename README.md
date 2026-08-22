@@ -359,6 +359,40 @@ thread, drop-and-count on overflow, never raises into the caller, and completely
 inert when `LO_API_KEY` is unset. Point it at a dead endpoint and your code runs
 exactly as before — there is a test that asserts precisely that.
 
+`instrument()` also takes an OpenAI client — and therefore Groq, Together,
+OpenRouter, vLLM and Ollama, which all use the same client against a different
+`base_url`. Async clients work too; the wrapper decides whether to await from
+the method it is wrapping.
+
+```python
+from openai import AsyncOpenAI
+client = instrument(AsyncOpenAI(base_url="http://localhost:11434/v1"))
+```
+
+Pass it something it does not recognise and it **raises**, rather than returning
+a proxy that quietly traces nothing. The SDK's never-raise rule is about the
+request path — a span that cannot be recorded is dropped — and a client that
+cannot be instrumented is a configuration error worth finding at startup.
+
+### Using LangChain, LlamaIndex, or another framework?
+
+There is deliberately **no LangChain or LlamaIndex integration in this SDK.**
+Those frameworks already have OpenTelemetry instrumentation — OpenLLMetry and
+Logfire both ship it — and this platform speaks OTLP. So the supported path
+needs no bespoke callback handler and no code change at all:
+
+```bash
+pip install opentelemetry-instrumentation-langchain   # or -llamaindex
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8000/otlp
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer lo_live_..."
+```
+
+Writing our own handlers would mean shipping a *worse* path — one that requires
+editing your application — to reach coverage the OTLP endpoint already provides,
+while taking on a maintenance treadmill every time a framework changes its
+callback API. Implementing the protocol is what makes the per-framework
+integrations unnecessary.
+
 ### Already using OpenTelemetry?
 
 Then you do not need the SDK above. An application instrumented with

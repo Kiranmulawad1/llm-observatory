@@ -6,7 +6,10 @@ library is negotiable; that property is not.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import pathlib
+import re
 import time
 
 import pytest
@@ -341,3 +344,252 @@ class TestSpanBuilders:
         first = s.finish().duration_ms
         time.sleep(0.01)
         assert s.finish().duration_ms == first
+
+
+# --- instrument() ----------------------------------------------------------
+#
+# Fakes rather than the real vendor SDKs, deliberately. Installing anthropic and
+# openai to test this package would put them in the dev tree of a library whose
+# whole point is a one-dependency floor, and the thing under test is our
+# proxying and our field mapping — not whether the vendor's client works.
+
+
+class _Usage:
+    def __init__(self, **fields: object) -> None:
+        self.__dict__.update(fields)
+
+
+class _TextBlock:
+    type = "text"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _AnthropicResponse:
+    def __init__(self) -> None:
+        self.usage = _Usage(input_tokens=900, output_tokens=150)
+        self.content = [_TextBlock("hello")]
+        self.model = "claude-sonnet-5-20260101"
+        self.stop_reason = "end_turn"
+
+
+class _OpenAIMessage:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _OpenAIChoice:
+    def __init__(self) -> None:
+        self.message = _OpenAIMessage("hello")
+        self.finish_reason = "stop"
+
+
+class _OpenAIResponse:
+    def __init__(self) -> None:
+        self.usage = _Usage(prompt_tokens=900, completion_tokens=150)
+        self.choices = [_OpenAIChoice()]
+        self.model = "gpt-4.1-mini-2026-01-01"
+
+
+class _FakeAnthropic:
+    def __init__(self, *, is_async: bool = False) -> None:
+        self.messages = _FakeMessages(is_async=is_async)
+        self.api_key = "sk-ant-test"
+
+
+class _FakeMessages:
+    def __init__(self, *, is_async: bool) -> None:
+        self.calls: list[dict] = []
+        if is_async:
+            self.create = self._acreate  # type: ignore[assignment]
+        else:
+            self.create = self._create  # type: ignore[assignment]
+
+    def _create(self, **kwargs: object) -> _AnthropicResponse:
+        self.calls.append(kwargs)
+        return _AnthropicResponse()
+
+    async def _acreate(self, **kwargs: object) -> _AnthropicResponse:
+        await asyncio.sleep(0.01)
+        self.calls.append(kwargs)
+        return _AnthropicResponse()
+
+
+class _FakeOpenAI:
+    def __init__(self, *, is_async: bool = False) -> None:
+        self.chat = _FakeChat(is_async=is_async)
+
+
+class _FakeChat:
+    def __init__(self, *, is_async: bool) -> None:
+        self.completions = _FakeCompletions(is_async=is_async)
+
+
+class _FakeCompletions:
+    def __init__(self, *, is_async: bool) -> None:
+        self.calls: list[dict] = []
+        if is_async:
+            self.create = self._acreate  # type: ignore[assignment]
+        else:
+            self.create = self._create  # type: ignore[assignment]
+
+    def _create(self, **kwargs: object) -> _OpenAIResponse:
+        self.calls.append(kwargs)
+        return _OpenAIResponse()
+
+    async def _acreate(self, **kwargs: object) -> _OpenAIResponse:
+        await asyncio.sleep(0.01)
+        self.calls.append(kwargs)
+        return _OpenAIResponse()
+
+
+class TestInstrumentAnthropic:
+    def test_call_produces_a_span_with_usage(self, _isolated_client: list[dict]) -> None:
+        from llm_observatory import instrument
+
+        client = instrument(_FakeAnthropic())
+        client.messages.create(
+            model="claude-sonnet-5", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        [payload] = _isolated_client
+        assert payload["name"] == "anthropic.messages.create"
+        assert payload["kind"] == "llm"
+        assert payload["prompt_tokens"] == 900
+        assert payload["completion_tokens"] == 150
+        assert payload["output"]["text"] == "hello"
+
+    def test_response_model_overrides_the_requested_one(self, _isolated_client: list[dict]) -> None:
+        """A dated build answers a request for an alias; the latter is what ran."""
+        from llm_observatory import instrument
+
+        instrument(_FakeAnthropic()).messages.create(model="claude-sonnet-5", messages=[])
+        assert _isolated_client[0]["model"] == "claude-sonnet-5-20260101"
+
+    def test_system_prompt_is_captured(self, _isolated_client: list[dict]) -> None:
+        """Anthropic takes it as a top-level argument, not as a message."""
+        from llm_observatory import instrument
+
+        instrument(_FakeAnthropic()).messages.create(model="m", messages=[], system="be terse")
+        assert _isolated_client[0]["input"]["system"] == "be terse"
+
+    def test_unwrapped_attributes_pass_through(self) -> None:
+        from llm_observatory import instrument
+
+        assert instrument(_FakeAnthropic()).api_key == "sk-ant-test"
+
+
+class TestInstrumentOpenAI:
+    def test_call_produces_a_span_with_usage(self, _isolated_client: list[dict]) -> None:
+        from llm_observatory import instrument
+
+        client = instrument(_FakeOpenAI())
+        client.chat.completions.create(model="gpt-4.1-mini", messages=[])
+
+        [payload] = _isolated_client
+        assert payload["name"] == "openai.chat.completions.create"
+        assert payload["kind"] == "llm"
+        # Different field names from Anthropic's, for the same two numbers.
+        assert payload["prompt_tokens"] == 900
+        assert payload["completion_tokens"] == 150
+        assert payload["output"]["text"] == "hello"
+
+    def test_finish_reason_is_recorded(self, _isolated_client: list[dict]) -> None:
+        from llm_observatory import instrument
+
+        instrument(_FakeOpenAI()).chat.completions.create(model="m", messages=[])
+        assert _isolated_client[0]["metadata"]["finish_reason"] == "stop"
+
+    def test_the_underlying_call_still_happens(self) -> None:
+        from llm_observatory import instrument
+
+        raw = _FakeOpenAI()
+        instrument(raw).chat.completions.create(model="m", messages=[{"role": "user"}])
+        assert raw.chat.completions.calls == [{"model": "m", "messages": [{"role": "user"}]}]
+
+
+class TestAsyncClients:
+    """The bug this rewrite fixed.
+
+    An async client's method is also called `create`; it just returns a
+    coroutine. Wrapping it as if it were sync recorded a span with no tokens and
+    a duration of roughly zero, then handed the un-awaited coroutine back — so
+    every async call was silently mistraced while the dashboard looked fine.
+    """
+
+    async def test_async_anthropic_is_awaited_and_recorded(
+        self, _isolated_client: list[dict]
+    ) -> None:
+        from llm_observatory import instrument
+
+        client = instrument(_FakeAnthropic(is_async=True))
+        response = await client.messages.create(model="claude-sonnet-5", messages=[])
+
+        assert isinstance(response, _AnthropicResponse)
+        [payload] = _isolated_client
+        assert payload["prompt_tokens"] == 900
+        # The span must cover the awaited call, not close before it starts.
+        assert payload["duration_ms"] >= 10
+
+    async def test_async_openai_is_awaited_and_recorded(self, _isolated_client: list[dict]) -> None:
+        from llm_observatory import instrument
+
+        client = instrument(_FakeOpenAI(is_async=True))
+        response = await client.chat.completions.create(model="gpt-4.1-mini", messages=[])
+
+        assert isinstance(response, _OpenAIResponse)
+        [payload] = _isolated_client
+        assert payload["completion_tokens"] == 150
+        assert payload["duration_ms"] >= 10
+
+
+class TestUnknownClients:
+    def test_unrecognised_client_raises_at_setup(self) -> None:
+        """Loud at setup rather than an empty dashboard later.
+
+        The never-raise rule governs the request path: a span that cannot be
+        recorded is dropped. A client we cannot instrument is a configuration
+        error, and returning a proxy that traces nothing is how someone ends up
+        searching for a bug that produced no error message.
+        """
+        from llm_observatory import instrument
+
+        class NotAnLLMClient:
+            pass
+
+        with pytest.raises(TypeError, match="does not recognise"):
+            instrument(NotAnLLMClient())
+
+    def test_the_error_names_what_is_supported(self) -> None:
+        from llm_observatory import instrument
+
+        with pytest.raises(TypeError, match=re.escape("chat.completions.create")):
+            instrument(object())
+
+
+class TestDependencyFloor:
+    def test_instrumentation_imports_no_vendor_sdk(self) -> None:
+        """Detection is duck-typed on purpose.
+
+        `isinstance` checks would mean importing anthropic and openai, which
+        would put them in the dependency floor of a package whose entire
+        selling point is that it has one (ADR 0001).
+        """
+        import llm_observatory._tracing as tracing
+
+        # Parsed, not grepped: the docstrings in this module legitimately show
+        # `from openai import OpenAI` as usage, and a text search would flag it.
+        # What matters is whether an import statement exists, which is a
+        # question about the AST.
+        tree = ast.parse(pathlib.Path(tracing.__file__).read_text())
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+
+        assert not imported & {"anthropic", "openai"}, (
+            f"vendor SDK imported at module scope: {imported & {'anthropic', 'openai'}}"
+        )

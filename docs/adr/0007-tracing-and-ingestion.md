@@ -150,6 +150,42 @@ breaking us and anything unwrapped passes straight through. Response parsing is
 defensive throughout: a renamed field must degrade to a span with less detail,
 never raise into the caller's model call.
 
+### `instrument()` covers two client shapes, and refuses the rest
+
+Anthropic (`.messages.create`) and OpenAI-compatible (`.chat.completions.create`)
+— the second of which is Groq, Together, OpenRouter, vLLM and Ollama too, since
+they share a client. Detection is duck-typed on attributes rather than
+`isinstance`, because importing the vendor SDKs to identify a client would put
+them in this package's dependency floor, and ADR 0001 keeps that at httpx alone.
+
+An unrecognised client **raises**. The never-raise rule governs the request
+path: a span that cannot be recorded is dropped, because telemetry must not
+break someone's application. Setup is a different question, and returning a
+proxy that silently traces nothing leaves an engineer staring at an empty
+dashboard with no error to search for — which is exactly what passing an OpenAI
+client to this function used to do.
+
+Sync and async are decided from the wrapped callable at call time, not baked
+into separate method names. An async client's method is also called `create`; it
+just returns a coroutine. The previous version defined `create` as sync and
+`acreate` as async, which no vendor SDK is shaped like, so every async call
+produced a span with no token counts and a duration near zero while the real
+call went untraced. Wrong data is worse than missing data, because nobody
+investigates a dashboard that looks fine.
+
+### No per-framework integrations, deliberately
+
+There are no LangChain or LlamaIndex callback handlers, and there should not be.
+Both frameworks already have OpenTelemetry instrumentation, and ADR 0012 made
+this platform speak OTLP — so a user of either points an exporter at it with two
+environment variables and no code change.
+
+A bespoke handler would deliver the same coverage through a *worse* path, one
+that requires editing the application, while taking on a maintenance treadmill
+every time a framework revises its callback API. Implementing the protocol is
+what makes the per-framework integrations unnecessary; shipping both would be
+admitting the protocol work did not land.
+
 ## Consequences
 
 - **Ingest is idempotent** on `(started_at, span_id)`, which is what makes the
