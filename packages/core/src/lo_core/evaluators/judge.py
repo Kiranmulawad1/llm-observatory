@@ -123,7 +123,7 @@ class JudgeEvaluator(Evaluator[JudgeConfig]):
 
         messages = self._render(sample, self._template)
 
-        response = await self._provider.generate(
+        response = await self._provider.generate_measured(
             GenerationRequest(
                 messages=messages,
                 model=self._model,

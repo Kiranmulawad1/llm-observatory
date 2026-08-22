@@ -19,6 +19,7 @@ resources:
   - api-deployment.yaml
   - api-service.yaml
   - worker-deployment.yaml
+  - worker-service.yaml
   - web-deployment.yaml
   - web-service.yaml
   - postgres.yaml

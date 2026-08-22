@@ -1,0 +1,23 @@
+# A Service for a workload that serves no traffic.
+#
+# It exists purely so Prometheus has a stable set of endpoints to discover:
+# scraping pod IPs directly means re-resolving them on every rollout, and a
+# headless Service gives the scraper the pod list without putting a load
+# balancer in front of something that must never receive traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lo-worker-metrics
+  labels:
+    app.kubernetes.io/name: lo-worker
+spec:
+  # Headless: no ClusterIP, no load balancing. There is nothing to balance —
+  # every worker pod must be scraped individually, or the metrics would be
+  # whichever pod the Service happened to pick.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: lo-worker
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics

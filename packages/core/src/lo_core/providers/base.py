@@ -17,6 +17,7 @@ matter more than the indirection costs:
 from __future__ import annotations
 
 import abc
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -73,6 +74,41 @@ class GenerationProvider(abc.ABC):
 
     @abc.abstractmethod
     async def generate(self, request: GenerationRequest) -> GenerationResponse: ...
+
+    async def generate_measured(self, request: GenerationRequest) -> GenerationResponse:
+        """`generate`, wrapped in the platform's own latency and error metrics.
+
+        Wrapped here rather than inside each provider so a new vendor is
+        instrumented by existing — the same reasoning that put the
+        sampling-parameter check in one shared place. Callers use this; the
+        subclass only implements the API call.
+
+        Labelled by provider, never by model: model names come from
+        user-authored prompt versions, so labelling by them would let a tenant
+        create unbounded series in the platform's monitoring.
+        """
+        from lo_core import metrics
+
+        operation = "judge" if request.response_schema is not None else "generate"
+        started = time.perf_counter()
+        try:
+            response = await self.generate(request)
+        except ProviderError as exc:
+            metrics.provider_errors.labels(
+                provider=self.name, retryable=str(exc.retryable).lower()
+            ).inc()
+            raise
+        except Exception:
+            # Anything not already a ProviderError is a bug on our side rather
+            # than the vendor's, but it is still a failed model call and hiding
+            # it would make the error rate look better than it is.
+            metrics.provider_errors.labels(provider=self.name, retryable="false").inc()
+            raise
+        finally:
+            metrics.provider_duration.labels(provider=self.name, operation=operation).observe(
+                time.perf_counter() - started
+            )
+        return response
 
     async def aclose(self) -> None:
         """Release any client resources. Called once when a run finishes.

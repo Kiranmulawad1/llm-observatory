@@ -34,6 +34,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lo_core import metrics
 from lo_core.db import session_scope
 from lo_core.db.models.dataset import DatasetItem
 from lo_core.db.models.evaluation import DeadLetterJob, EvalResult, EvalRun, EvalScore
@@ -204,6 +205,12 @@ async def _run_items(
 
     async with session_scope() as session:
         aggregates = await compute_aggregates(session, run_id)
+        # Read rather than passed in: a run can be picked up, retried, or
+        # resumed by a different worker, so the authoritative start time is the
+        # one on the row, not one this process happened to observe.
+        run_started_at = await session.scalar(
+            select(EvalRun.started_at).where(EvalRun.id == run_id)
+        )
         total_completed = await session.scalar(
             select(func.count())
             .select_from(EvalResult)
@@ -216,6 +223,7 @@ async def _run_items(
         # provider outage, and into "failed" would discard usable results.
         status = "succeeded" if failures == 0 else ("partial" if completed else "failed")
 
+        finished_at = datetime.now(UTC)
         await session.execute(
             update(EvalRun)
             .where(EvalRun.id == run_id)
@@ -224,9 +232,20 @@ async def _run_items(
                 completed_items=total_completed,
                 failed_items=failures,
                 aggregate_scores={k: v.model_dump() for k, v in aggregates.items()},
-                finished_at=datetime.now(UTC),
+                finished_at=finished_at,
             )
         )
+
+    # Duration from the run's own timestamps rather than a timer around this
+    # function: a run can be picked up, retried, or resumed by a different
+    # worker, and the number worth alerting on is how long the *run* took from
+    # the user's point of view, not how long this process was busy.
+    if run_started_at is not None:
+        metrics.eval_run_duration.labels(status=status).observe(
+            (finished_at - run_started_at).total_seconds()
+        )
+    metrics.eval_examples.labels(outcome="scored").inc(total_completed or 0)
+    metrics.eval_examples.labels(outcome="errored").inc(failures)
 
     log.info("eval.run.finished", run_id=str(run_id), status=status, failed=failures)
     return status
@@ -259,7 +278,7 @@ async def _execute_item(
                 )
             rendered = [RenderedMessage(role="user", content=raw)]
 
-        response = await generation.generate(
+        response = await generation.generate_measured(
             GenerationRequest(
                 messages=rendered,
                 model=config["model"],

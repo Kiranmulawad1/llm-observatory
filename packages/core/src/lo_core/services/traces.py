@@ -11,6 +11,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lo_core import metrics
 from lo_core.db.models.telemetry import Span, Trace
 from lo_core.errors import NotFoundError
 from lo_core.schemas.telemetry import (
@@ -26,6 +27,10 @@ async def ingest_spans(
     session: AsyncSession,
     project_id: uuid.UUID,
     spans: list[SpanIngest],
+    *,
+    # Which wire format this batch arrived on. A metric label, not behaviour —
+    # the two paths converge here precisely so they cannot diverge.
+    source: str = "native",
 ) -> TraceIngestResponse:
     """Store a batch of spans and refresh the rollup for every trace they touch.
 
@@ -68,6 +73,14 @@ async def ingest_spans(
         .returning(Span.span_id)
     )
     inserted = len((await session.execute(stmt)).scalars().all())
+
+    metrics.ingest_batches.labels(source=source).inc()
+    metrics.spans_ingested.labels(source=source).inc(inserted)
+    if len(rows) - inserted:
+        # Duplicates are expected — the SDK retries without knowing whether the
+        # first attempt landed — but a *rising* rate means retry logic is
+        # misfiring, which is invisible without counting them.
+        metrics.spans_rejected.labels(source=source, reason="duplicate").inc(len(rows) - inserted)
 
     trace_ids = {s.trace_id for s in spans}
     for trace_id in trace_ids:

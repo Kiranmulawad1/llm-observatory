@@ -429,6 +429,32 @@ prove the alert came from you.
 `trace_count below N` doubles as a heartbeat — it catches a pipeline that stopped
 sending, which no threshold-above rule would ever see.
 
+### Watching the platform itself
+
+An observability tool that cannot answer "how am *I* doing" is an awkward thing
+to demo. Both services expose Prometheus metrics — ingest rate, queue depth,
+eval run duration, provider latency and error counts:
+
+```bash
+curl -s localhost:8000/metrics | grep '^lo_'     # API, no credential needed
+curl -s localhost:9464/metrics | grep '^lo_'     # worker, its own port
+```
+
+There are now two metrics systems, and the split is deliberate:
+`/projects/{slug}/metrics` answers *"how is my application behaving"* for one
+tenant out of TimescaleDB; `/metrics` answers *"how is the platform behaving"*
+for whoever operates it.
+
+**Nothing on `/metrics` is labelled by project, model, prompt or user.** A
+Prometheus label per tenant is a permanent time series per tenant — including
+tenants who left a year ago, since nothing tells Prometheus a project was
+deleted. That rule is also what makes it safe to serve the endpoint without a
+credential: there is no tenant data in it to leak, and the access control is the
+NetworkPolicy. A test enforces both halves together
+([ADR 0014](docs/adr/0014-self-observability.md)).
+
+Import `infra/grafana/platform-health.json` for the dashboard.
+
 ### The data flywheel
 
 Turn production failures into eval examples:
@@ -585,3 +611,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0011 — Deployment topology: containers, Kubernetes, GCP](docs/adr/0011-deployment-topology.md)
 - [ADR 0012 — OTLP ingest and the GenAI semantic conventions](docs/adr/0012-otlp-ingest.md)
 - [ADR 0013 — One adapter for every OpenAI-compatible endpoint](docs/adr/0013-openai-compatible-provider.md)
+- [ADR 0014 — Self-observability and the cardinality line](docs/adr/0014-self-observability.md)

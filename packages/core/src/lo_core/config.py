@@ -74,6 +74,14 @@ class Settings(BaseSettings):
         description="Platform operator token. Creates projects and issues project keys.",
     )
 
+    # Where the worker exposes /metrics.
+    #
+    # The API serves its own on the port it already has; the worker has no HTTP
+    # server, so it starts one just for this. 9464 is the OpenTelemetry
+    # Prometheus exporter's conventional port, which makes the intent obvious
+    # to anyone reading a Service definition.
+    metrics_port: int = 9464
+
     # --- Provider credentials (optional until Phase 3) --------------------
     anthropic_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None

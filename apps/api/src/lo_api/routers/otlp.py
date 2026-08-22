@@ -35,6 +35,7 @@ from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
 
 from lo_api.dependencies import DbSession, IngestPrincipal
 from lo_api.otlp import decode_json, decode_protobuf, decompress, to_span_ingest
+from lo_core import metrics
 from lo_core.errors import ForbiddenError, RateLimitError, ValidationError
 from lo_core.ratelimit import check_rate_limit
 from lo_core.schemas.telemetry import MAX_SPANS_PER_BATCH
@@ -125,6 +126,7 @@ async def export_traces(
         # Broad on purpose: one unmappable span must not sink the batch.
         except Exception as exc:
             rejected += 1
+            metrics.spans_rejected.labels(source="otlp", reason="unmappable").inc()
             if len(reasons) < 3:
                 reasons.append(f"{otlp_span.span_id or '<no id>'}: {exc}")
 
@@ -133,7 +135,7 @@ async def export_traces(
         # special handling here because `refresh_trace` recomputes a trace's
         # rollup from all of its stored spans rather than patching deltas — a
         # child arriving before its parent is already the normal case.
-        await service.ingest_spans(session, project_id, mapped)
+        await service.ingest_spans(session, project_id, mapped, source="otlp")
 
     return _response(
         content_type,

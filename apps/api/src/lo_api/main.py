@@ -19,10 +19,15 @@ from lo_api.routers import (
     metrics,
     otlp,
     projects,
+    prometheus,
     prompts,
     review,
     traces,
 )
+
+# Aliased: `metrics` is already the tenant-facing router imported above, and
+# these are the platform's own. Two different audiences, similar words.
+from lo_core import metrics as platform_metrics
 from lo_core.config import get_settings
 from lo_core.db import dispose_engine
 from lo_core.logging import configure_logging, get_logger
@@ -37,6 +42,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
     # Crash-loop loudly on an unsafe config rather than serving with dev defaults.
     settings.assert_production_safe()
+    # Always 1; the labels are the payload. Lets a dashboard tell a rolling
+    # deploy apart from a restart loop without reading pod names.
+    platform_metrics.build_info.labels(service="lo-api", environment=settings.environment).set(1)
     log.info("api.startup", environment=settings.environment)
     yield
     # Drain both pools so a terminating pod releases its Postgres and Redis
@@ -78,6 +86,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     app.include_router(health.router)
+    app.include_router(prometheus.router)
     app.include_router(projects.router)
     app.include_router(prompts.router)
     app.include_router(datasets.router)

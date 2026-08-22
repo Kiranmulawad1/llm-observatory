@@ -15,7 +15,9 @@ from typing import Any
 
 from arq import cron
 from arq.connections import RedisSettings
+from prometheus_client import start_http_server
 
+from lo_core import metrics
 from lo_core.config import get_settings
 from lo_core.db import dispose_engine
 from lo_core.logging import configure_logging, get_logger
@@ -36,7 +38,28 @@ async def startup(ctx: dict[str, Any]) -> None:
     settings = get_settings()
     configure_logging()
     settings.assert_production_safe()
-    log.info("worker.startup", environment=settings.environment)
+
+    # The worker serves no HTTP of its own, so Prometheus has nothing to scrape
+    # unless we give it something. `start_http_server` runs a minimal WSGI
+    # server on a daemon thread: it cannot block arq's event loop, and it dies
+    # with the process rather than holding shutdown open.
+    #
+    # A separate port from the API's, and one that is *only* metrics — the
+    # worker has no readiness contract to serve and nothing else should be able
+    # to reach it. The NetworkPolicy admits the monitoring namespace and
+    # nothing else.
+    start_http_server(settings.metrics_port)
+    # "lo-worker" literally, not settings.service_name. Which binary is running
+    # is a fact about this process, not configuration — and a deployment that
+    # forgot LO_SERVICE_NAME would label worker metrics as the API's, silently
+    # merging two services into one set of series.
+    metrics.build_info.labels(service="lo-worker", environment=settings.environment).set(1)
+
+    log.info(
+        "worker.startup",
+        environment=settings.environment,
+        metrics_port=settings.metrics_port,
+    )
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:

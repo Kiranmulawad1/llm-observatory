@@ -22,6 +22,9 @@ dependencies = [
     # present here).
     "anthropic>=0.69",
     "openai>=1.60",
+    # Self-observability: metric definitions are shared by the API and the
+    # worker, so they live in core and cannot drift apart.
+    "prometheus-client>=0.21",
 ]
 
 [project.optional-dependencies]

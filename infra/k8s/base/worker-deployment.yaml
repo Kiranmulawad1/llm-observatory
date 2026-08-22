@@ -37,6 +37,13 @@ spec:
         - name: worker
           image: llm-observatory/worker:dev
           imagePullPolicy: IfNotPresent
+          ports:
+            # Metrics only. The worker consumes from a queue and serves no
+            # traffic; this port exists so Prometheus has something to scrape,
+            # and the NetworkPolicy admits the monitoring namespace to it and
+            # nothing else.
+            - name: metrics
+              containerPort: 9464
           envFrom:
             - configMapRef:
                 name: lo-config

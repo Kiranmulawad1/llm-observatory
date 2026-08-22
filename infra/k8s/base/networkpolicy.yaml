@@ -61,6 +61,11 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: lo-web
+        # Prometheus, for /metrics. Served on the same port as everything else,
+        # so this is an extra source rather than an extra port.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
       ports:
         - { protocol: TCP, port: 8000 }
   egress:
@@ -109,7 +114,21 @@ spec:
     matchLabels:
       app.kubernetes.io/component: worker
   policyTypes: [Ingress, Egress]
-  # No ingress rules at all: nothing should ever connect *to* a worker.
+  ingress:
+    # Metrics scraping, and only that.
+    #
+    # This policy previously had no ingress rules at all, on the reasoning that
+    # nothing should ever connect to a worker. Adding /metrics makes that no
+    # longer true — and the connection needs permitting on *this* side as well
+    # as on the scraper's, which is the rule that already cost this project one
+    # debugging session (see ADR 0011). A worker whose metrics port is silently
+    # firewalled looks exactly like a worker that is not running.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - { protocol: TCP, port: 9464 }
   egress:
     - to:
         - podSelector:
