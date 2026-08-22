@@ -78,6 +78,38 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None
 
+    # The setting that turns one adapter into support for a dozen vendors.
+    #
+    # Groq, Together, OpenRouter, Fireworks, vLLM and Ollama all serve the
+    # OpenAI Chat Completions API, so which one you are talking to is a URL
+    # rather than a code path. Unset means OpenAI itself.
+    #
+    #   https://api.groq.com/openai/v1      https://openrouter.ai/api/v1
+    #   http://localhost:11434/v1  (Ollama) http://localhost:8000/v1  (vLLM)
+    openai_base_url: str | None = Field(
+        default=None,
+        description="Base URL for any OpenAI-compatible endpoint. Unset means OpenAI.",
+    )
+
+    @field_validator("anthropic_api_key", "openai_api_key", "admin_token", mode="before")
+    @classmethod
+    def _blank_secret_is_unset(cls, v: object) -> object:
+        """An empty string means "not configured", not "configured as empty".
+
+        `.env.example` ships these keys present but blank, so a fresh checkout
+        loads `SecretStr("")` rather than `None`. Anything checking `is None`
+        then believes a credential exists and passes "" to a vendor SDK, which
+        fails with the SDK's own error instead of the actionable one written
+        here — and it does so for *every* new user, since blank is the default
+        state of the file.
+
+        Normalising at the boundary fixes it once, for every consumer, including
+        ones added later.
+        """
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
     @field_validator("database_url")
     @classmethod
     def _require_async_driver(cls, v: PostgresDsn) -> PostgresDsn:

@@ -54,3 +54,22 @@ def test_deployed_environment_rejects_sql_echo() -> None:
     s = _settings(environment="staging", api_key_pepper="real-secret", database_echo=True)
     with pytest.raises(RuntimeError, match="query parameters"):
         s.assert_production_safe()
+
+
+def test_blank_provider_key_is_treated_as_unset() -> None:
+    """`.env.example` ships these keys present but empty.
+
+    A fresh checkout therefore loads `SecretStr("")`, and any consumer checking
+    `is None` would conclude a credential exists and hand `""` to a vendor SDK —
+    producing that SDK's opaque error instead of the actionable one. Blank means
+    unset, normalised here so every consumer inherits it.
+    """
+    s = _settings(anthropic_api_key="", openai_api_key="   ")
+    assert s.anthropic_api_key is None
+    assert s.openai_api_key is None
+
+
+def test_a_real_provider_key_survives_normalisation() -> None:
+    s = _settings(openai_api_key="sk-real")
+    assert s.openai_api_key is not None
+    assert s.openai_api_key.get_secret_value() == "sk-real"
