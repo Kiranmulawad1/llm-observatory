@@ -29,8 +29,9 @@ from lo_core.logging import get_logger
 
 log = get_logger(__name__)
 
-# Spans per minute per project. Generous — the SDK batches, so a normal
-# application sends a handful of requests a minute regardless of traffic.
+# Fallback when no limit is passed and settings are unavailable. The real
+# default lives in `Settings.ingest_rate_limit_per_minute`, so a deployment can
+# raise or lower it without a code change — see the comment there.
 DEFAULT_LIMIT = 6000
 WINDOW_SECONDS = 60
 
@@ -65,14 +66,20 @@ class RateLimitResult:
 async def check_rate_limit(
     project_id: uuid.UUID,
     cost: int = 1,
-    limit: int = DEFAULT_LIMIT,
+    limit: int | None = None,
 ) -> RateLimitResult:
     """Consume `cost` units from the project's window.
 
     `cost` is the number of spans in the batch, not 1 per request — otherwise a
     client could send 500-span batches a thousand times a minute and stay inside
     a request-count limit while writing half a million rows.
+
+    `limit` defaults to the configured ceiling rather than to a constant, so a
+    deployment can size it for its own tenants.
     """
+    if limit is None:
+        limit = get_settings().ingest_rate_limit_per_minute
+
     key = f"ratelimit:ingest:{project_id}"
     now = time.time()
     window_start = now - WINDOW_SECONDS

@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap up up-all down clean api worker web lint fmt typecheck test test-unit logs psql redis-cli migrate migration downgrade \
+.PHONY: bench bench-api bench-clean help bootstrap up up-all down clean api worker web lint fmt typecheck test test-unit logs psql redis-cli migrate migration downgrade \
         images k8s-render k8s-validate kind-up kind-deploy kind-status kind-down tf-init tf-validate tf-fmt infra-check
 
 help: ## Show available targets
@@ -158,3 +158,29 @@ tf-fmt: ## Canonical formatting for every .tf file
 
 infra-check: k8s-validate tf-validate ## Everything CI checks about infrastructure
 	cd infra/terraform && terraform fmt -check -recursive .
+
+# --- Benchmark --------------------------------------------------------------
+
+BENCH_VUS ?= 20
+BENCH_DURATION ?= 60s
+BENCH_BATCH ?= 50
+
+bench-api: ## Run the API configured for benchmarking (raised rate limit)
+	@# The shipped 6000 spans/min per project is a tenant-fairness ceiling, not
+	@# a capacity ceiling. Leaving it in place would benchmark the rate limiter
+	@# and report its value as the platform's throughput.
+	LO_INGEST_RATE_LIMIT_PER_MINUTE=100000000 \
+		uv run uvicorn lo_api.main:app --host 0.0.0.0 --port 8000 --log-level warning
+
+bench: ## Run the k6 ingest benchmark against a running API
+	@command -v k6 >/dev/null || (echo "k6 not installed: brew install k6" && exit 1)
+	@test -n "$$(grep '^LO_ADMIN_TOKEN=.\+' .env)" || (echo "run 'make bootstrap' first" && exit 1)
+	@echo "Start the API with 'make bench-api' in another terminal first."
+	LO_ADMIN_TOKEN=$$(grep '^LO_ADMIN_TOKEN=' .env | cut -d= -f2) \
+	BENCH_VUS=$(BENCH_VUS) BENCH_DURATION=$(BENCH_DURATION) BENCH_BATCH=$(BENCH_BATCH) \
+		k6 run bench/ingest.js
+
+bench-clean: ## Delete rows a benchmark run created
+	@# ~380 bytes per span; a few runs quietly consume a developer's disk.
+	docker compose exec -T postgres psql -U $${POSTGRES_USER:-lo} -d $${POSTGRES_DB:-llm_observatory} \
+		-f /dev/stdin < bench/cleanup.sql

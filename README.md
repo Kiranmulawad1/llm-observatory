@@ -429,6 +429,43 @@ prove the alert came from you.
 `trace_count below N` doubles as a heartbeat — it catches a pipeline that stopped
 sending, which no threshold-above rule would ever see.
 
+### How fast is ingest?
+
+Measured, not estimated — `bench/ingest.js` (k6) against the local compose
+stack. **Spans per second, because batch size is a free variable and a
+request-rate figure means nothing without it.**
+
+| concurrent clients | spans/sec | native p50 / p95 / p99 | OTLP p50 / p95 / p99 |
+| --- | --- | --- | --- |
+| 5 | 3,270 | 68 / 94 / 120 ms | 76 / 107 / 135 ms |
+| 10 | 3,230 | 144 / 205 / 468 ms | 151 / 194 / 256 ms |
+| 20 | 3,230 | 280 / 382 / 488 ms | 310 / 489 / 630 ms |
+| 40 | 3,277 | 579 / 830 / 1050 ms | 612 / 1110 / 1720 ms |
+
+50-span batches, zero failed requests at every level.
+
+**Throughput is flat while latency scales linearly with concurrency.** That is
+saturation, not headroom: by Little's Law, if the arrival rate is pinned by the
+server then extra clients can only add queueing. Saturation is at or below 5
+concurrent clients, so the useful figure is **~3,250 spans/sec sustained with
+p95 under 100 ms** — not the largest number a higher client count can be made
+to print.
+
+OTLP costs roughly 10–20% over the native path at the same load, which is the
+protobuf-shaped decoding and GenAI attribute mapping it does and the native
+path does not.
+
+The bottleneck is the single uvicorn process, deliberately: the API runs one
+process per pod because `prometheus_client` holds counters in process memory
+([ADR 0014](docs/adr/0014-self-observability.md)), so the platform scales out on
+replicas rather than up on `--workers`.
+
+<sub>Apple M2, 8 cores, 8 GB RAM, macOS 26.5. Postgres and Redis in Docker on
+the same machine, no network hop, one replica of everything, and the host
+filesystem at 100% capacity while recording — so these are a floor for this
+hardware, not a capacity claim about the software. Methodology and the full
+list of caveats: [bench/README.md](bench/README.md).</sub>
+
 ### Watching the platform itself
 
 An observability tool that cannot answer "how am *I* doing" is an awkward thing
@@ -612,3 +649,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0012 — OTLP ingest and the GenAI semantic conventions](docs/adr/0012-otlp-ingest.md)
 - [ADR 0013 — One adapter for every OpenAI-compatible endpoint](docs/adr/0013-openai-compatible-provider.md)
 - [ADR 0014 — Self-observability and the cardinality line](docs/adr/0014-self-observability.md)
+- [ADR 0015 — Measuring ingest throughput](docs/adr/0015-load-benchmark.md)

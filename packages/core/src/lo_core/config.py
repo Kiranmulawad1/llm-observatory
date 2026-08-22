@@ -74,6 +74,19 @@ class Settings(BaseSettings):
         description="Platform operator token. Creates projects and issues project keys.",
     )
 
+    # Ingest rate limit, spans per minute per project.
+    #
+    # Configuration rather than a constant: the right ceiling depends on who is
+    # sending. A single-tenant internal deployment wants it high; a public one
+    # wants it low enough to bound one noisy tenant. Hardcoding it also made the
+    # platform impossible to benchmark — a load test against a fixed 6000/min
+    # measures the limiter and reports it as the platform's capacity.
+    ingest_rate_limit_per_minute: int = Field(
+        default=6000,
+        gt=0,
+        description="Spans per minute per project accepted by the ingest endpoints.",
+    )
+
     # Where the worker exposes /metrics.
     #
     # The API serves its own on the port it already has; the worker has no HTTP
