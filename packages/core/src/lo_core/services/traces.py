@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections import deque
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -273,25 +274,67 @@ async def get_trace(session: AsyncSession, project_id: uuid.UUID, trace_id: str)
     return detail
 
 
+# Pydantic's serialiser refuses to descend past 255 levels, so a tree deeper
+# than that cannot be returned at all — the endpoint raises and the whole trace
+# becomes unreadable rather than merely deep. Bounded below that with room to
+# spare; spans past the bound are still returned, as orphan subtrees.
+#
+# A trace this deep is not exotic. A recursive agent or a runaway loop produces
+# one, and the ingest API accepts whatever nesting a client sends.
+MAX_TREE_DEPTH = 200
+
+
 def build_tree(spans: list[Span]) -> tuple[SpanNode | None, list[SpanNode]]:
     """Turn flat span rows into a tree.
 
     One pass to build the nodes, one to link them — O(n), not the O(n²) that
     searching for each span's children would cost.
 
-    A span whose `parent_span_id` names a span that is not in this set is
-    returned as an orphan rather than dropped. That happens legitimately: the
-    parent may still be buffered in the SDK, or a flush may have been partial.
-    Hiding those spans would make a trace look complete when it is not.
+    **Nothing is ever dropped.** A span that cannot be placed in the tree is
+    returned as an orphan, because hiding it would make a trace look complete
+    when it is not. There are three ways a span fails to be placed, and all
+    three are reachable from client input — span ids come from the instrumented
+    application, so the shapes arriving here are bounded by what a buggy or
+    hostile SDK can emit rather than by what our own SDK does:
+
+    * **Its parent is absent.** Legitimate and common: the parent may still be
+      buffered in the SDK, or a flush may have been partial.
+    * **It is part of a cycle.** A span naming itself as its parent, or two
+      spans naming each other. Linking those produces an object graph that
+      serialises forever, so the upward link is broken and each member of the
+      cycle becomes an orphan root.
+    * **It is deeper than `MAX_TREE_DEPTH`.** The subtree is detached and
+      returned as an orphan rather than nested past the serialiser's limit.
+
+    Duplicate span ids collapse to one node. The spans table is keyed
+    `(started_at, span_id)` because Timescale requires the partitioning column
+    in every unique index, so the same span id arriving with a different
+    timestamp is two rows — and appending both to their parent would return the
+    same span twice.
     """
-    nodes: dict[str, SpanNode] = {s.span_id: SpanNode.model_validate(s) for s in spans}
+    # First occurrence wins. `get_trace` orders by `started_at`, so that is the
+    # earliest observation of the span.
+    unique: dict[str, Span] = {}
+    for span in spans:
+        unique.setdefault(span.span_id, span)
+
+    nodes: dict[str, SpanNode] = {
+        span_id: SpanNode.model_validate(span) for span_id, span in unique.items()
+    }
+    cyclic = _spans_in_cycles(unique)
 
     root: SpanNode | None = None
     orphans: list[SpanNode] = []
 
-    for span in spans:
-        node = nodes[span.span_id]
-        if span.parent_span_id is None:
+    for span_id, span in unique.items():
+        node = nodes[span_id]
+
+        if span_id in cyclic:
+            # Deliberately not linked to its parent: that link is the cycle.
+            # Children of this span still attach to it, so the subtree hanging
+            # off a cycle is preserved rather than scattered.
+            orphans.append(node)
+        elif span.parent_span_id is None:
             # Two roots would mean two traces sharing an id. Keep the first and
             # treat the rest as orphans rather than silently discarding one.
             if root is None:
@@ -305,7 +348,72 @@ def build_tree(spans: list[Span]) -> tuple[SpanNode | None, list[SpanNode]]:
             else:
                 parent.children.append(node)
 
+    _bound_depth(root, orphans)
     return root, orphans
+
+
+def _spans_in_cycles(spans: dict[str, Span]) -> set[str]:
+    """Span ids that lie on a parent-pointer cycle.
+
+    Each span has at most one parent, so the graph is a forest of chains and
+    the walk is a straightforward three-colour traversal: follow parents,
+    marking the current path, and if the path meets itself everything from the
+    meeting point onwards is a cycle. Nodes whose *ancestors* contain a cycle
+    are not themselves cyclic — they attach normally to a parent that has been
+    made an orphan root, which keeps their subtree intact.
+    """
+    unvisited, in_progress, done = 0, 1, 2
+    state = dict.fromkeys(spans, unvisited)
+    cyclic: set[str] = set()
+
+    for start in spans:
+        if state[start] != unvisited:
+            continue
+
+        path: list[str] = []
+        current: str | None = start
+        while current is not None and current in spans:
+            if state[current] == in_progress:
+                cyclic.update(path[path.index(current) :])
+                break
+            if state[current] == done:
+                break
+            state[current] = in_progress
+            path.append(current)
+            current = spans[current].parent_span_id
+
+        for span_id in path:
+            state[span_id] = done
+
+    return cyclic
+
+
+def _bound_depth(root: SpanNode | None, orphans: list[SpanNode]) -> None:
+    """Detach anything nested past `MAX_TREE_DEPTH` into `orphans`, in place.
+
+    Breadth-first with an explicit queue rather than recursion: the input that
+    makes this necessary is precisely the input that would overflow the stack on
+    the way to discovering it.
+    """
+    queue: deque[tuple[SpanNode, int]] = deque()
+    if root is not None:
+        queue.append((root, 1))
+    queue.extend((orphan, 1) for orphan in orphans)
+
+    while queue:
+        node, depth = queue.popleft()
+        if not node.children:
+            continue
+
+        if depth >= MAX_TREE_DEPTH:
+            detached = node.children
+            node.children = []
+            for child in detached:
+                orphans.append(child)
+                # Re-queued at depth 1: it is the root of its own subtree now.
+                queue.append((child, 1))
+        else:
+            queue.extend((child, depth + 1) for child in node.children)
 
 
 async def trace_cost(

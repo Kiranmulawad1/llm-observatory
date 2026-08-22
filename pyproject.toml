@@ -34,6 +34,8 @@ dev = [
     "types-regex>=2024.11",
     # Stubs for the generated OTLP protobuf modules (OTLP ingest, ADR 0012).
     "types-protobuf>=5.29",
+    # Property-based testing for span-tree assembly (ADR 0007).
+    "hypothesis>=6.120",
 ]
 
 [tool.uv.sources.lo-api]
@@ -111,3 +113,9 @@ addopts = "-q --strict-markers"
 markers = [
     "integration: requires live Postgres/Redis (docker compose up db redis)",
 ]
+
+[tool.hypothesis]
+# A failing example is written to .hypothesis/ and replayed first on the next
+# run, so a shrunk counterexample is reproduced deterministically rather than
+# waiting for the generator to rediscover it.
+database_file = ".hypothesis/examples"
