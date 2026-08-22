@@ -262,6 +262,20 @@ lo localhost:8000/projects/demo/eval/runs/<run-id> | jq '{status, aggregate_scor
 lo localhost:8000/dead-letters
 ```
 
+Run against a real model without an account: the `openai` provider takes any
+OpenAI-compatible endpoint, so one adapter covers OpenAI, Groq, Together,
+OpenRouter, vLLM and **Ollama on your laptop**.
+
+```bash
+# Local, free, no key — the whole eval engine against a model on your machine.
+export LO_GENERATION_PROVIDER=openai
+export LO_OPENAI_BASE_URL=http://localhost:11434/v1
+```
+
+Cost is recorded only when talking to OpenAI itself: the same model name costs
+different amounts at different gateways, and a confidently wrong cost figure is
+worse than an absent one ([ADR 0013](docs/adr/0013-openai-compatible-provider.md)).
+
 `generation_provider` defaults to `fake` — deterministic, free, no API key — so
 the whole flow above runs offline. Set `LO_ANTHROPIC_API_KEY` and pass
 `"generation_provider":"anthropic"` to evaluate against a real model.
@@ -360,6 +374,11 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer lo_live_..."
 to, which is why the collector-compatible endpoint lives under `/otlp` rather
 than fighting the native SDK for `/v1/traces`. Both protobuf and JSON are
 accepted, because protobuf is what the OTel SDKs send by default.
+
+**OTLP/HTTP only — `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is not supported.** It is
+the default in several language SDKs, and pointing a gRPC exporter here means
+nothing arrives with no obvious reason why, so set the protocol explicitly if
+your SDK defaults to gRPC.
 
 The GenAI semantic conventions are mapped onto the same span model the native
 SDK writes to — tokens, model, cost and operation kind become real columns, and
@@ -562,3 +581,4 @@ These are the rules the codebase actually enforces, not aspirations:
 - [ADR 0010 — Authentication and authorisation](docs/adr/0010-authentication-and-authorisation.md)
 - [ADR 0011 — Deployment topology: containers, Kubernetes, GCP](docs/adr/0011-deployment-topology.md)
 - [ADR 0012 — OTLP ingest and the GenAI semantic conventions](docs/adr/0012-otlp-ingest.md)
+- [ADR 0013 — One adapter for every OpenAI-compatible endpoint](docs/adr/0013-openai-compatible-provider.md)

@@ -16,6 +16,8 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
+from lo_core.errors import ValidationError
+
 PRICING_CHECKED = date(2026, 6, 24)
 
 # USD per 1,000,000 tokens, as (input, output).
@@ -33,6 +35,19 @@ PRICING: dict[str, tuple[Decimal, Decimal]] = {
     "claude-sonnet-5": (Decimal("3.00"), Decimal("15.00")),
     "claude-sonnet-4-6": (Decimal("3.00"), Decimal("15.00")),
     "claude-haiku-4-5": (Decimal("1.00"), Decimal("5.00")),
+    # OpenAI, via the openai-compatible provider.
+    #
+    # These rates describe **OpenAI's own endpoint only**. The same model name
+    # served by Groq, Together or OpenRouter costs something different, and a
+    # self-hosted vLLM server costs nothing per token at all — so the provider
+    # only consults this table when `base_url` points at api.openai.com, and
+    # records None otherwise. See `_should_price` in openai_provider.py.
+    "gpt-4.1": (Decimal("2.00"), Decimal("8.00")),
+    "gpt-4.1-mini": (Decimal("0.40"), Decimal("1.60")),
+    "gpt-4.1-nano": (Decimal("0.10"), Decimal("0.40")),
+    "gpt-4o": (Decimal("2.50"), Decimal("10.00")),
+    "gpt-4o-mini": (Decimal("0.15"), Decimal("0.60")),
+    "o3-mini": (Decimal("1.10"), Decimal("4.40")),
 }
 
 # Models that reject `temperature`, `top_p` and `top_k` outright — the request
@@ -55,6 +70,16 @@ SAMPLING_UNSUPPORTED: frozenset[str] = frozenset(
 
 SAMPLING_PARAMETERS: frozenset[str] = frozenset({"temperature", "top_p", "top_k"})
 
+# OpenAI's reasoning models reject sampling parameters the same way, but their
+# names carry version suffixes (`o3-mini-2025-01-31`), so they are matched by
+# prefix rather than by exact membership.
+#
+# Like the pricing above this is a hand-maintained snapshot, and it errs toward
+# the families that are unambiguous today rather than guessing at ones that are
+# not. A model missing from here fails at the provider with a readable 400
+# instead of at request time — worse, but not wrong.
+OPENAI_REASONING_PREFIXES: tuple[str, ...] = ("o1", "o3", "o4")
+
 
 def compute_cost(model: str, input_tokens: int, output_tokens: int) -> Decimal | None:
     """Cost in USD, or None when the model is not in the table.
@@ -71,8 +96,37 @@ def compute_cost(model: str, input_tokens: int, output_tokens: int) -> Decimal |
     return (Decimal(input_tokens) * input_rate + Decimal(output_tokens) * output_rate) / million
 
 
+def rejects_sampling_parameters(model: str) -> bool:
+    """Whether `model` refuses temperature/top_p/top_k outright."""
+    if model in SAMPLING_UNSUPPORTED:
+        return True
+    return model.startswith(OPENAI_REASONING_PREFIXES)
+
+
 def unsupported_sampling_parameters(model: str, parameters: dict[str, object]) -> list[str]:
     """Sampling parameters present in `parameters` that `model` will reject."""
-    if model not in SAMPLING_UNSUPPORTED:
+    if not rejects_sampling_parameters(model):
         return []
     return sorted(SAMPLING_PARAMETERS & parameters.keys())
+
+
+def assert_sampling_supported(model: str, parameters: dict[str, object]) -> None:
+    """Raise if `model` will reject the sampling parameters in `parameters`.
+
+    Called when an eval run is *requested*, so the failure is one 422 on one API
+    call rather than N provider 400s discovered partway through a run that has
+    already been paid for.
+
+    Shared across providers rather than written per vendor: the situation is not
+    Anthropic-specific. It arises anywhere a prompt version stores decoding
+    parameters (ADR 0004) and the model named at run time is newer than the
+    prompt — which is every reasoning model, from either vendor.
+    """
+    rejected = unsupported_sampling_parameters(model, parameters)
+    if rejected:
+        raise ValidationError(
+            f"model {model!r} does not accept {', '.join(rejected)}. "
+            "This prompt version records decoding parameters that reasoning models "
+            "reject; remove them from the version's parameters, or run against a "
+            "model that still accepts them."
+        )

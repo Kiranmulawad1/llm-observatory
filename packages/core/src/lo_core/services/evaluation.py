@@ -94,10 +94,14 @@ async def create_run(
 
     # The collision described in providers/anthropic_provider.py: a stored
     # prompt version can carry sampling parameters that a newer model rejects.
-    if payload.generation_provider == "anthropic":
-        from lo_core.providers.anthropic_provider import validate_request
+    #
+    # Checked for every real provider rather than branching per vendor — the
+    # problem belongs to reasoning models generally, not to one API. The fake
+    # provider is exempt because it accepts anything and is what CI runs.
+    if payload.generation_provider != "fake":
+        from lo_core.providers.pricing import assert_sampling_supported
 
-        validate_request(model, parameters)
+        assert_sampling_supported(model, parameters)
 
     # Resolve the judge rubric now, so a run pins the exact rubric version that
     # scored it. Without this pin a score change is unattributable between the

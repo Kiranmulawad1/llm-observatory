@@ -21,6 +21,7 @@ dependencies = [
     # typed errors, and it is a thin dependency (httpx + pydantic, both already
     # present here).
     "anthropic>=0.69",
+    "openai>=1.60",
 ]
 
 [project.optional-dependencies]

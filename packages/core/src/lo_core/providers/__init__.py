@@ -18,7 +18,7 @@ from lo_core.providers.base import (
 )
 from lo_core.providers.fake import FakeEmbeddingProvider, FakeGenerationProvider
 
-GENERATION_PROVIDERS = ("fake", "anthropic")
+GENERATION_PROVIDERS = ("fake", "anthropic", "openai")
 EMBEDDING_PROVIDERS = ("fake", "local")
 
 
@@ -29,6 +29,13 @@ def get_generation_provider(name: str) -> GenerationProvider:
         from lo_core.providers.anthropic_provider import AnthropicProvider
 
         return AnthropicProvider()
+    if name == "openai":
+        # Covers every OpenAI-compatible endpoint — Groq, Together, OpenRouter,
+        # vLLM, Ollama — selected by LO_OPENAI_BASE_URL rather than by name, so
+        # the registry does not grow an entry per vendor.
+        from lo_core.providers.openai_provider import OpenAIProvider
+
+        return OpenAIProvider()
     raise ValidationError(
         f"unknown generation provider {name!r}; available: {', '.join(GENERATION_PROVIDERS)}"
     )

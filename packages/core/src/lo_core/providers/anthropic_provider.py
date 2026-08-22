@@ -31,7 +31,7 @@ from lo_core.providers.base import (
     GenerationResponse,
     ProviderError,
 )
-from lo_core.providers.pricing import compute_cost, unsupported_sampling_parameters
+from lo_core.providers.pricing import assert_sampling_supported, compute_cost
 
 DEFAULT_MODEL = "claude-opus-5"
 
@@ -44,17 +44,11 @@ _PASSTHROUGH: frozenset[str] = frozenset({"temperature", "top_p", "top_k", "stop
 def validate_request(model: str, parameters: dict[str, Any]) -> None:
     """Reject a model/parameter combination the API will refuse.
 
-    Called when an eval run is *requested* so the failure is a 422 on one API
-    call, rather than N provider 400s discovered partway through a run.
+    Thin alias kept because this provider's docstring explains *why* the check
+    exists; the check itself is shared, since the collision is not vendor
+    specific. See `pricing.assert_sampling_supported`.
     """
-    rejected = unsupported_sampling_parameters(model, parameters)
-    if rejected:
-        raise ValidationError(
-            f"model {model!r} does not accept {', '.join(rejected)}. "
-            "This prompt version records decoding parameters that newer models "
-            "reject; remove them from the version's parameters, or run against a "
-            "model that still accepts them."
-        )
+    assert_sampling_supported(model, parameters)
 
 
 class AnthropicProvider(GenerationProvider):
