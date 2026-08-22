@@ -843,6 +843,17 @@ would turn "mean faithfulness for this run" into JSONB gymnastics instead of a
 
 The trap is describing *features*. Describe **decisions and their consequences**.
 
+> This section covers the core data model, written early. Sections 10–21 each
+> end with a **"How this reads on a résumé"** block covering the later work —
+> tracing, auth, Kubernetes, OTLP, self-observability, the benchmark and the
+> property tests. Those are the ones with numbers and bugs in them, which tend
+> to hold up better under follow-up questions than architecture description.
+>
+> The single strongest line in the whole project is probably the one in §16:
+> finding a data-corruption bug that only appears under standard OpenTelemetry
+> batch-export semantics. It is specific, verifiable from one commit, and the
+> obvious follow-up — *how did you find it?* — has a real answer.
+
 **"Walk me through the project."**
 > It's a self-hosted eval and observability platform for LLM apps. The core
 > insight is that most LLM quality problems are record-keeping problems: teams
@@ -914,6 +925,22 @@ The trap is describing *features*. Describe **decisions and their consequences**
 | 8 | API keys per project, auth everywhere | ✅ |
 | 9 | Kubernetes manifests, Terraform for GCP | ✅ |
 | 10 | CI/CD with plan → approve → apply | ✅ |
+
+All ten phases are done. Six further pieces of work came after them, driven by
+review rather than by the original plan, and each is explained in its own
+section below:
+
+| | Work | Why it happened |
+| --- | --- | --- |
+| §16 | OTLP ingest | adopting the platform should not require re-instrumenting |
+| §17 | OpenAI-compatible provider | evaluate against any vendor, including one on your laptop |
+| §18 | Self-observability | an observability tool that watches nothing of its own is awkward |
+| §19 | Load benchmark | "it ingests spans" invites "how many?" |
+| §20 | SDK instrumentation rewrite | it silently mistraced every async call |
+| §21 | Property-based tests | the inputs are client-supplied, so examples are the wrong tool |
+
+Four of those six found bugs that were already shipped. That pattern is worth
+noticing: none of them were found by writing more features.
 
 **Phase 5 is a real shift.** Everything so far writes to the `control` schema:
 low volume, transactional, foreign keys everywhere. Traces are the opposite —
@@ -2516,7 +2543,1188 @@ different conversation from "I built a RAG pipeline".
 
 ---
 
-## 15. Where to look when you're stuck
+## 15. Phase 10 — shipping safely, explained
+
+### What this phase is actually about
+
+Not "automate the deploy". Automating a deploy is easy and mostly a matter of
+writing the commands down. This phase is about **where a human belongs in an
+automated pipeline**, which is a design question, not a scripting one.
+
+The pipeline is:
+
+```
+build → push by digest → terraform plan → ⏸ human approval → apply → migrate → roll out
+```
+
+The approval is never granted in this project — there is no cloud account behind
+it. What is real is the shape.
+
+### The one idea worth taking away: approve a *plan*, not a *permission*
+
+Here is the version almost everyone writes first:
+
+```yaml
+- run: terraform plan          # human looks at the output
+- name: Wait for approval      # human clicks approve
+- run: terraform apply         # ...and this re-plans from scratch
+```
+
+That looks correct and is subtly worthless. `terraform apply` with no arguments
+computes a **fresh** plan against whatever the state looks like *now*. Between
+the review and the click, state can have moved — somebody else applied, a
+resource drifted, a data source returned something different. The human approved
+one set of changes and the pipeline performed another.
+
+The fix is that the plan is a *file*:
+
+```yaml
+- run: terraform plan -out=tfplan        # the exact changes, saved
+- uses: actions/upload-artifact@v4       # ...uploaded
+- run: terraform show tfplan             # ...rendered for a human to read
+      # ⏸ approval
+- run: terraform apply tfplan            # ...and THAT file is applied
+```
+
+Terraform refuses to apply a saved plan whose state has moved on since it was
+created. So the property is *enforced*, not hoped for:
+
+> **What was reviewed is what runs, or nothing runs.**
+
+That sentence is the whole phase. If you remember one thing from this document
+for an infrastructure interview, this is a good candidate — because everyone has
+seen an approval step, and most of them were theatre.
+
+One related detail: a plan file is not a diff. It records every attribute of
+every resource, including ones Terraform marks sensitive. It is a state
+document, which is why the artifact has short retention and never leaves the
+runner.
+
+### Tags versus digests
+
+```
+llm-observatory/api:v1.4.2                    ← a name that points at bytes
+llm-observatory/api@sha256:9f86d081...        ← the bytes
+```
+
+A tag is a mutable pointer. Someone can push different bytes to `:v1.4.2` after
+the review that approved it — accidentally, with a misconfigured CI job, or
+deliberately. A digest is the content hash: there is no "different bytes with
+the same digest".
+
+So the build job resolves each tag to its digest once, and everything downstream
+carries `registry/image@sha256:…`. The registry is *also* configured with
+immutable tags (Terraform), which is belt and braces — but the digest is the
+belt, because it is what the manifests actually reference.
+
+### `-detailed-exitcode`, and why an exit code matters
+
+```bash
+terraform plan -detailed-exitcode -out=tfplan
+#   0 = no changes
+#   1 = error
+#   2 = changes to apply
+```
+
+Without it, a plan that *failed* and a plan with *nothing to do* both exit 0.
+The pipeline would then present an error to a human as though it were a set of
+changes to approve. The three-way exit code is the only way to tell "fine",
+"nothing to do", and "broken" apart programmatically.
+
+### Rollback is asymmetric, and pretending otherwise is dangerous
+
+A failed rollout runs `kubectl rollout undo`. Kubernetes keeps the previous
+ReplicaSet, so this is genuinely an undo.
+
+A failed **apply** is *not* reverted, and the workflow says so in its own error
+message. Terraform has no undo. Reverting infrastructure means generating a new
+plan in the opposite direction and reviewing it — and auto-generating an
+unreviewed plan during an incident is the worst possible moment to skip the gate
+you built.
+
+A "rollback" job that quietly ran `terraform apply` against the previous commit
+would *look* responsible and be the opposite. Knowing which of your two rollback
+paths is real is worth more than having two.
+
+### Why the gate is a GitHub Environment
+
+`environment: production` on a job makes it block until a required reviewer
+approves. It records who approved which deployment, and cannot be bypassed by
+re-running one job.
+
+There are popular third-party "wait for approval" actions that simulate this by
+opening an issue and polling it. They exist because required reviewers are a
+**paid** feature on *private* repositories. This repository is public, where it
+is free. Using the workaround anyway would be copying a solution to a problem
+you do not have — which is a good miniature of what "cargo cult" means in
+practice.
+
+**The environment is a repository setting, not code.** Without creating it, the
+pipeline applies without asking. That is worth saying out loud, because "the
+gate is in the YAML" is exactly the assumption that leaves it unenforced.
+
+### The preflight job, and why red X's are corrosive
+
+Every deploy job is gated on two repository variables being set. With no cloud
+account, they are not, so every job skips — grey, with a notice explaining what
+to configure.
+
+The alternative is every push to main showing a red X for credentials that are
+missing *on purpose*. That is worse than it sounds: a permanently-failing check
+teaches everyone to ignore failing checks, and then a real failure hides in the
+noise. A pipeline that is honestly "not configured" is better than one that is
+dishonestly "broken".
+
+### What to test by hand
+
+There is no deploy to watch, so the checks are static:
+
+```bash
+brew install actionlint
+actionlint                         # type-checks every ${{ }}, shellchecks every run:
+```
+
+Then read the run history on GitHub after any push to main: the CD workflow
+should be **green with four skipped jobs**, not red.
+
+You can verify the digest mechanism yourself:
+
+```bash
+cd infra/k8s/overlays/gcp
+kustomize edit set image llm-observatory/api=example.dev/api@sha256:$(printf 'a%.0s' {1..64})
+kubectl kustomize . | grep 'image: example.dev'      # pinned by digest
+git checkout kustomization.yaml
+```
+
+### Simplifications, and what production adds
+
+- **No staging environment.** The approved production plan has never been
+  applied anywhere first. A staging deploy without an approval gate is the
+  normal answer.
+- **No progressive delivery.** All replicas roll after one smoke test. Argo
+  Rollouts or Flagger would shift traffic gradually and roll back automatically
+  on error rate — which is what the Phase 6 metrics exist to feed.
+- **No drift detection.** A scheduled `terraform plan` that alerts when reality
+  and state diverge, rather than finding out mid-deploy.
+- **No image signing.** Cosign and SLSA provenance would make the digest's
+  immutability backed by a signature rather than by trusting the registry.
+
+### How this reads on a résumé
+
+Not "set up CI/CD". The story is:
+
+> Built a deployment pipeline where the artifact a human approves is the exact
+> plan that gets applied, so an approval cannot be invalidated by intervening
+> state — and deployed by image digest rather than tag so approved bytes cannot
+> be re-pointed after review.
+
+Both halves are about the same idea: **making review mean something.** That is a
+different conversation from "I used GitHub Actions".
+
+---
+
+## 16. Speaking OTLP — explained
+
+### The problem this solves
+
+You built a tracing SDK in Phase 5. It is three lines to adopt and it never
+breaks the host application. It is also *yours*, and that is the problem.
+
+Most teams worth targeting are already instrumented — with OpenTelemetry
+directly, or through OpenLLMetry, Logfire, or a Collector that is already in the
+path. Asking them to instrument a second time, with your library, is asking them
+to redo work they have finished. That is the single most common reason a
+self-hosted tool never gets *evaluated*, let alone adopted.
+
+So: accept the protocol they already speak.
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8000/otlp
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer lo_live_..."
+```
+
+Two environment variables. No code change. That is the whole pitch.
+
+### Why the endpoint is at `/otlp/v1/traces`
+
+OTLP's standard path is `/v1/traces`. Your native SDK already serves that, with
+a different JSON body. Collision.
+
+The tempting fix is to look at the request and work out which one it is. That
+fails: OTLP has a JSON encoding too, so OTLP-JSON and native-JSON are *both*
+`application/json`. Distinguishing them means inspecting the body for a
+`resourceSpans` key — which is a guess dressed up as a protocol.
+
+The actual fix is a detail of how exporters work. `OTEL_EXPORTER_OTLP_ENDPOINT`
+is a **base URL**; every exporter appends `/v1/traces` to it. So mounting at
+`/otlp` hands them exactly the URL they were going to build anyway:
+
+```
+base:     http://host/otlp
+exporter: http://host/otlp/v1/traces      ← appended by the client, not by us
+```
+
+Zero ambiguity, zero cost to the user, native endpoint untouched. Reading the
+spec closely beat being clever about content types.
+
+### Protobuf, and why JSON alone would not do
+
+The OpenTelemetry SDKs send **protobuf** over HTTP by default. Supporting only
+JSON would turn "change one setting" into "change one setting and override the
+encoding", which is precisely the friction the endpoint exists to remove. So it
+accepts both.
+
+And it replies in the encoding it received. Answering a protobuf export with
+JSON makes the exporter log a parse failure on every *successful* export — which
+to whoever reads those logs is indistinguishable from data loss.
+
+### Three generations of the same attribute
+
+The GenAI semantic conventions are young, and every instrumentation library sits
+at a different point in their history. All three of these are live *right now*:
+
+| meaning | current | earlier | OpenLLMetry |
+| --- | --- | --- | --- |
+| input tokens | `gen_ai.usage.input_tokens` | `gen_ai.usage.prompt_tokens` | `llm.usage.prompt_tokens` |
+| model | `gen_ai.response.model` | `gen_ai.request.model` | `llm.request.model` |
+
+Reading all of them is a few lines and spares every user from patching their
+instrumentation. Where several appear, the newest wins — an exporter emitting
+both is mid-upgrade, and the new key is the one it will keep.
+
+Response model beats request model, incidentally, because the request says
+`gpt-4` and the response says `gpt-4-0613`, and the question worth answering is
+what actually served the call.
+
+### Span kind comes from attributes, never from the name
+
+```python
+# What we do
+if attributes.get("gen_ai.operation.name") == "embeddings": return "embedding"
+if attributes.get("db.system") in VECTOR_STORES:            return "retrieval"
+
+# What we deliberately do not do
+if "retriev" in span.name:                                  return "retrieval"
+```
+
+Span names are free text chosen by whoever wrote the instrumentation. A
+classifier keyed off them silently changes behaviour the day someone renames a
+function — and nothing fails, the data just quietly becomes wrong. Attributes
+are a contract; names are prose.
+
+Anything unrecognised is kept in `metadata` rather than dropped, because the
+conventions will keep moving and "still searchable" beats "silently gone".
+
+### Partial success, not rejection
+
+If one span in a batch of 500 cannot be mapped, the other 499 are stored and the
+response reports `rejectedSpans: 1`.
+
+The reason is mechanical. An exporter that receives a 4xx **retries the
+identical payload**, forever. Rejecting the batch would cost the 499 good spans
+on every single attempt, permanently, because the one bad span never changes.
+
+### The bug this found, which was not about OTLP at all
+
+Writing the out-of-order tests turned up a **pre-existing data-corruption bug**
+in the trace rollup.
+
+`traces.started_at` is `MIN(span.started_at)` — and it is part of the primary
+key, because Timescale requires the partitioning column in every unique index.
+
+Now: spans complete innermost-first, while a batching exporter flushes on a
+timer. So a *parent*, which started earlier, routinely arrives *later* than its
+children. When it does, the minimum moves earlier, the upsert's conflict target
+no longer matches the stored row, and a **second rollup row is inserted for the
+same trace**. Every read then raises `MultipleResultsFound`.
+
+The trace becomes unreadable — broken by *late* data, not by bad data.
+
+The native SDK never triggered it because it buffers a trace and tends to flush
+the root alongside its children. Anything batching on a timer does not.
+
+The fix reads existing rows, upserts, then deletes superseded ones — and
+carries `flagged_at` forward explicitly, because that field is set by guardrail
+sampling rather than derived from spans. Re-keying without it would have
+silently dropped traces out of the human review queue: losing exactly the traces
+someone had decided were worth looking at.
+
+**This is the most valuable thing in the whole task**, and it is worth
+understanding why: the feature was a few hundred lines of protocol mapping,
+competent and unglamorous. The bug was a correctness failure in the existing
+system that only a new access pattern could expose.
+
+### What to test by hand
+
+```bash
+make up && make api
+
+# Issue an ingest key, then send a span as an OTel exporter would.
+lo() { curl -s -H "Authorization: Bearer $LO_ADMIN_TOKEN" "$@"; }
+KEY=$(lo -X POST localhost:8000/projects/demo/api-keys \
+  -H 'content-type: application/json' \
+  -d '{"name":"otel","scopes":["ingest"]}' | jq -r .key)
+
+curl -i -X POST localhost:8000/otlp/v1/traces \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"resourceSpans":[{"scopeSpans":[{"spans":[{
+        "traceId":"'$(openssl rand -hex 16)'","spanId":"'$(openssl rand -hex 8)'",
+        "name":"chat","startTimeUnixNano":"1755000000000000000",
+        "endTimeUnixNano":"1755000001000000000",
+        "attributes":[{"key":"gen_ai.request.model","value":{"stringValue":"gpt-4"}}]}]}]}]}'
+```
+
+Then open the trace in the dashboard: the span should be `kind: llm` with the
+model populated — mapped from the attribute, not from the name.
+
+### Simplifications, and what production adds
+
+- **HTTP only.** `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is not supported and is the
+  default in several language SDKs. Someone will point a gRPC exporter here, see
+  nothing arrive, and have no idea why — which is why it is called out in the
+  README next to the setup snippet, not buried in an ADR.
+- **gzip only.** zstd and snappy appear in Collector configs, though neither is
+  in the OTLP/HTTP spec.
+- **No `/v1/metrics` or `/v1/logs`.** Same shape of problem; traces first
+  because traces are what this platform is about.
+- **Rejected spans are counted, not kept.** So a mapping bug is invisible after
+  the fact.
+
+### How this reads on a résumé
+
+> Implemented OTLP/HTTP ingest mapping the OpenTelemetry GenAI semantic
+> conventions onto an existing span model, so an already-instrumented
+> application adopts the platform with a configuration change and no code
+> change.
+
+And the stronger companion line, from the bug:
+
+> Found and fixed a data-corruption bug that only manifests under standard
+> OpenTelemetry batch-export semantics, where a late-but-earlier span silently
+> duplicated a trace rollup and made the trace unreadable.
+
+The second is worth more than the first. Anyone can add an endpoint; noticing
+that late arrival breaks a primary key is a different kind of claim.
+
+---
+
+## 17. One adapter, many vendors — explained
+
+### The gap
+
+`config.py` had declared `openai_api_key` since Phase 1 and nothing ever read
+it. `GENERATION_PROVIDERS` was `("fake", "anthropic")`. A platform whose entire
+purpose is *comparing prompts and models* could reach exactly one vendor.
+
+### The decision: a URL, not a code path
+
+Groq, Together, OpenRouter, Fireworks, vLLM and Ollama all serve the **OpenAI
+Chat Completions API**. So the difference between them is a base URL:
+
+```bash
+LO_GENERATION_PROVIDER=openai
+LO_OPENAI_BASE_URL=https://api.groq.com/openai/v1     # or Together, or…
+```
+
+Writing six near-identical adapters would mean six places to fix the next time a
+response field moves, and a provider registry that grows an entry per vendor
+forever — when the thing that actually varies is configuration.
+
+There is a consequence that matters specifically for this project's zero-budget
+constraint:
+
+```bash
+LO_OPENAI_BASE_URL=http://localhost:11434/v1     # Ollama
+```
+
+That runs the **entire eval engine against a real model on your laptop**, with
+no account and no spend. "Real model evaluation" goes from something the project
+cannot demonstrate to something it can.
+
+### Cost is claimed only for OpenAI itself, and that is the interesting part
+
+`llama-3.3-70b` costs one thing on Groq, another on Together, and nothing per
+token on a vLLM server you run yourself. A pricing table keyed on *model name*
+cannot express that.
+
+So the provider computes cost **only** when `base_url` points at
+`api.openai.com`, and records `None` everywhere else.
+
+That follows a rule already set in `pricing.py`: an unpriced model is *unknown*
+cost, not zero. A dashboard total that is silently wrong is worse than one that
+is visibly incomplete — because a wrong number is the one somebody quotes in a
+meeting, and nobody quotes a blank.
+
+The `base_url` is stored in the span metadata, because months later the stored
+row is the only thing that says which vendor served that run.
+
+Absent token usage propagates as `None` for the same reason. Several compatible
+gateways omit `usage` entirely, and a run reporting zero tokens looks *free*
+rather than *unmeasured*.
+
+### The refactor it forced
+
+The check for "does this model reject `temperature`?" lived inside an
+Anthropic-specific branch in the evaluation service:
+
+```python
+if payload.generation_provider == "anthropic":
+    validate_request(model, parameters)
+```
+
+That is not an Anthropic problem. OpenAI's `o*` reasoning models reject sampling
+parameters identically. Left alone, a third vendor means a third `if`.
+
+It now lives in `pricing.assert_sampling_supported` and runs for every non-fake
+provider. Small change, and the general lesson is worth keeping: **a conditional
+naming a specific vendor is usually a missing abstraction.**
+
+(OpenAI's model names carry version suffixes — `o3-mini-2025-01-31` — so those
+families match by prefix rather than by exact set membership.)
+
+### Structured outputs, and refusing to degrade quietly
+
+The judge depends on `response_schema` to make a parse failure *impossible*
+rather than merely unlikely. OpenAI implements this as `response_format:
+json_schema` with `strict: true`.
+
+Not every "OpenAI-compatible" gateway does. The tempting fallback is to drop the
+schema and hope the model returns JSON anyway — which would reintroduce exactly
+the silent judge rot the schema exists to prevent: the model rephrases, parsing
+fails, every example scores null, and the run still reports success.
+
+So a rejection is caught and re-raised naming the endpoint and the cause. Fail
+loudly, or the failure arrives months later as scores nobody trusts.
+
+### The bug this found
+
+`.env.example` ships the provider keys **present but blank**:
+
+```bash
+LO_ANTHROPIC_API_KEY=
+LO_OPENAI_API_KEY=
+```
+
+pydantic loads that as `SecretStr("")` — which is *not* `None`. So every
+`if secret is None` check concluded a credential existed, handed `""` to the
+vendor SDK, and the user got the SDK's own opaque error instead of the
+actionable message written for exactly that case.
+
+That is the **default state of a fresh checkout**, so it would have hit
+essentially every first-time user — and it had been in the Anthropic provider
+since Phase 3.
+
+The fix is a validator at the settings boundary that normalises blank to `None`,
+so every consumer inherits it, including ones added later. Fixing it at each
+call site would have worked and would have been wrong: the next person to read a
+secret would reintroduce it.
+
+**Empty string is not the same as unset.** Worth remembering wherever
+configuration meets optional credentials.
+
+### What to test by hand
+
+```bash
+# Free, local, no key. Requires ollama with a model pulled.
+export LO_GENERATION_PROVIDER=openai
+export LO_OPENAI_BASE_URL=http://localhost:11434/v1
+make api
+# then run an eval and watch cost_usd come back null — deliberately, because
+# nobody knows what a token costs on your own machine.
+```
+
+Or without Ollama, just confirm the error is actionable:
+
+```bash
+unset LO_OPENAI_API_KEY LO_OPENAI_BASE_URL
+uv run python -c "
+from lo_core.providers import get_generation_provider
+get_generation_provider('openai')"
+# ValidationError naming LO_OPENAI_API_KEY — not an opaque SDK error
+```
+
+### Simplifications, and what production adds
+
+- **Per-endpoint pricing.** A `(base_url, model) → rate` table would let cost be
+  computed for third-party gateways instead of abandoned.
+- **A capability probe.** Structured-output support is discovered by being
+  rejected mid-run; asking `/models` at startup would surface it earlier.
+- **Per-provider concurrency.** Groq's rate limits differ sharply from OpenAI's;
+  the runner uses one concurrency setting for all of them.
+- **No streaming.** The provider interface does not model it at all.
+
+### How this reads on a résumé
+
+> Built a single provider adapter covering every OpenAI-compatible endpoint,
+> deliberately withholding cost attribution for third-party gateways because
+> identical model names carry different prices — recording unknown rather than
+> zero.
+
+The second clause is the one that shows judgement. Anyone can call an API;
+declining to report a number you cannot justify is the part that suggests you
+have been burned by a dashboard that lied.
+
+---
+
+## 18. Watching yourself — explained
+
+### The awkward question
+
+You have built a platform that collects latency, cost and error rates for other
+people's applications. Someone asks: *what does it collect about itself?*
+
+Until this task, nothing. If the queue backed up, a provider degraded, or the
+OTLP endpoint started rejecting spans, the only signal was a log line somebody
+happened to read.
+
+### Two metrics systems, on purpose
+
+This is the decision, and it is the one to be able to defend:
+
+| | TimescaleDB (`telemetry`) | Prometheus (`/metrics`) |
+| --- | --- | --- |
+| answers | "how is **my application** behaving?" | "how is **the platform** behaving?" |
+| read by | the tenant, in the dashboard | whoever operates the platform |
+| served at | `/projects/{slug}/metrics` | `/metrics` |
+| retention | months, per tenant | days, aggregate |
+| cardinality | high, and that is the point | low, deliberately |
+
+Having two looks like duplication until you see what happens when you merge
+them.
+
+### The cardinality trap
+
+Every distinct combination of label values in Prometheus is a **separate time
+series**, held in memory, forever.
+
+So this looks helpful:
+
+```python
+spans_ingested.labels(project_id=project.id).inc()     # DO NOT
+```
+
+and it is a bomb on a timer. Every tenant creates a permanent series in every
+metric they touch — **including tenants who churned a year ago**, because
+nothing tells Prometheus a project was deleted. A few hundred tenants is a
+memory problem. A few thousand is an outage in the monitoring system you
+installed to prevent outages.
+
+So nothing here is labelled by project, model, prompt, user or trace. The labels
+that exist are bounded sets defined in code: `source` is native-or-otlp,
+`provider` is one of three, `retryable` is a boolean.
+
+Two consequences worth spelling out:
+
+**`provider`, never `model`.** Model names come from user-authored prompt
+versions. A per-model label would let any tenant mint unbounded series in *your*
+monitoring, just by naming a model. That is a denial-of-service with no exploit
+code in it.
+
+**Route templates, never resolved paths.** `/projects/{project_slug}/traces`,
+not `/projects/acme/traces/4bf92f…`. And a request matching no route is recorded
+as `<unmatched>`, so spraying random 404s cannot mint labels either.
+
+A test walks the registry and fails if any `lo_*` metric carries a per-tenant
+label — the rule is enforced, not documented.
+
+### Why `/metrics` needs no credential, and why that is safe
+
+Every other endpoint requires one (Phase 8). This one does not, for the same
+reason `/healthz` does not: the scraper is infrastructure, it runs inside the
+cluster, and handing Prometheus a platform-operator token to poll every fifteen
+seconds would put that credential in a config file *on a schedule*.
+
+What makes it **safe** rather than merely convenient is the cardinality rule
+above — there is no tenant data in the output to leak. The access control is the
+NetworkPolicy, which admits only the monitoring namespace.
+
+The two decisions hold each other up, so they are tested together: one test
+asserts the endpoint answers without a credential, the next asserts no project
+slug appears in its output. If the second ever fails, the first stops being a
+considered trade-off and becomes a leak.
+
+That pairing — a convenience justified by an invariant, with a test on the
+invariant — is a pattern worth reusing.
+
+### Queue depth is reported by the API, not the workers
+
+The arq queue is **one shared Redis structure**. If every worker replica
+reported its depth, Prometheus would hold N identical series and a `sum()`
+across them would silently multiply: a five-deep queue reading as fifteen with
+three workers.
+
+The API is a single logical reader of a shared resource, and it already holds a
+Redis pool. It samples during the scrape, so the value is current rather than up
+to an interval stale — and a Redis failure logs and returns the rest of the
+registry, because a scrape must not fail because of the outage you are using it
+to debug.
+
+### The worker had no HTTP server
+
+It consumes from a queue and serves nothing, so there was nothing to scrape.
+`start_http_server` runs a minimal WSGI server on a **daemon thread**: it cannot
+block arq's event loop, and it dies with the process rather than holding
+shutdown open.
+
+That forced a change worth noticing. The worker's NetworkPolicy previously had
+**no ingress rules at all**, on the reasoning that nothing should ever connect
+to a worker. That is no longer true — and the connection has to be permitted on
+the worker's side as well as the scraper's. Same both-ends rule from §14, showing
+up again in a different costume.
+
+### One process per pod, and the flag that would break it
+
+`prometheus_client` keeps counters **in process memory**. The API runs one
+uvicorn process per pod, so a pod's counters are that pod's and Prometheus sums
+across pods.
+
+Adding `--workers 4` would silently break that: each worker process keeps its
+own counters, and a scrape returns whichever one happened to answer. There is a
+multiprocess mode, and adopting it means a shared directory and a different
+registry — a deliberate migration, not something that survives a flag being
+added in a hurry.
+
+This is stated in the module docstring, where somebody adding that flag will
+read it. Putting a constraint where it will be encountered beats putting it
+somewhere true.
+
+### A bug caught by running it rather than reading it
+
+The worker labelled its `build_info` with `settings.service_name`, which
+defaults to `lo-api` and only differs when `LO_SERVICE_NAME` is set. Any
+deployment forgetting that variable would have labelled worker metrics as the
+API's and silently merged two services into one set of series.
+
+It is now the literal string `lo-worker`. **Which binary is running is a fact
+about the process, not configuration.** Anything configurable is
+mis-configurable.
+
+### The Grafana dashboard is tested
+
+`infra/grafana/platform-health.json`. A dashboard referencing a renamed metric
+fails *silently*: it renders, the panel is simply empty, and nobody notices
+until the incident it was meant to show.
+
+So a test extracts every `lo_*` name from every panel's PromQL and asserts it
+exists in the registry. The rename becomes a test failure instead of a surprise.
+
+### What to test by hand
+
+```bash
+make up && make api          # and `make worker` in another terminal
+curl -s localhost:8000/metrics | grep '^lo_'     # API, no credential needed
+curl -s localhost:9464/metrics | grep '^lo_'     # worker, its own port
+
+# The invariant that makes the missing auth safe:
+curl -s localhost:8000/metrics | grep -c 'project_id=\|project_slug=\|model='
+# → 0
+```
+
+Import `infra/grafana/platform-health.json` into a local Grafana if you want the
+panels.
+
+### Simplifications, and what production adds
+
+- **Prometheus is not deployed.** The endpoints, policies and dashboard exist;
+  nothing scrapes them in anger, because that needs a cluster.
+- **No alerting rules as code** — queue depth growing for 15 minutes, 5xx ratio
+  over threshold — versioned next to the dashboard rather than clicked into a UI.
+- **No exemplars**, which link a slow histogram bucket to a specific trace id.
+  That is the one place a trace identifier legitimately belongs in Prometheus,
+  because an exemplar is sampled rather than a label.
+- **No dead-letter gauge.** Failed eval jobs land in `control.dead_letter_jobs`
+  and nothing surfaces that table's depth.
+
+### How this reads on a résumé
+
+> Instrumented the platform with Prometheus while deliberately excluding
+> per-tenant labels, keeping cardinality bounded — and used that constraint to
+> justify serving the endpoint unauthenticated, with a test enforcing both
+> halves together.
+
+The interesting claim is not "added metrics". It is knowing that a label is a
+commitment to a time series that outlives the thing it describes.
+
+---
+
+## 19. Measuring it — explained
+
+### Why a benchmark at all
+
+Every claim in this project so far has been about **correctness** — what it
+stores, what it refuses, what it recomputes. None was about **capacity**. "It
+ingests spans" invites "how many?", and the honest answer was that nobody had
+measured.
+
+A number you measured beats a number you estimated, and it beats no number by a
+lot.
+
+### Spans per second, not requests per second
+
+Batch size is a free variable. Doubling it halves the request rate while doing
+strictly *more* work. So a requests-per-second figure is uninterpretable without
+publishing the batch size next to it — and trivially inflatable by shrinking
+batches until the number looks good.
+
+Spans are what the platform stores, indexes and bills. Measure the unit that
+means something.
+
+### The rate limit had to be raised, and why that is not cheating
+
+The shipped default is 6000 spans/min per project. That is a **tenant-fairness**
+ceiling, not a capacity ceiling.
+
+Benchmarking against it would have measured the *rate limiter* and reported its
+configured value as the platform's throughput. That is worse than having no
+number, because it looks real.
+
+The limit was a hardcoded constant. It is now
+`Settings.ingest_rate_limit_per_minute` — a change the benchmark forced but
+which stands on its own: a single-tenant internal deployment and a public one
+want different ceilings, and neither should need a code change.
+
+### The result, and the thing it actually shows
+
+| concurrent clients | spans/sec | native p95 | OTLP p95 |
+| --- | --- | --- | --- |
+| 5 | 3,270 | 94 ms | 107 ms |
+| 10 | 3,230 | 205 ms | 194 ms |
+| 20 | 3,230 | 382 ms | 489 ms |
+| 40 | 3,277 | 830 ms | 1,110 ms |
+
+Look at the columns rather than any single row. **Throughput is flat. Latency
+scales linearly with concurrency.**
+
+That is the signature of a **saturated** system, and Little's Law says why:
+
+```
+L = λW          L = concurrency, λ = throughput, W = time in system
+```
+
+If λ is pinned by the server, then increasing L can only increase W. Every extra
+client is queueing, not working. The server was already at capacity at five
+concurrent clients.
+
+### What that means for how you quote the number
+
+The largest figure in the table is 3,277 spans/sec, at 40 clients — with p95
+latency of 830 ms.
+
+Quoting that would be technically true and misleading. It is the *same*
+throughput as the 5-client run, with nine times the latency. Both rows describe
+one system; only one of them describes a system anyone would want to run.
+
+> **~3,250 spans/sec sustained, p95 under 100 ms.**
+
+Throughput *plus the concurrency at which latency is still healthy*. If someone
+asks "how do you know it is saturated?", you have an answer — and that follow-up
+question is the entire value of having measured properly.
+
+### k6, not Locust
+
+Locust is Python and would match the stack, which is exactly the objection: a
+Python load generator saturating a Python server measures the generator as much
+as the target — and it fails *silently*, because the generator's ceiling looks
+like the server's.
+
+k6's virtual users are goroutines, so one laptop can hold enough concurrency to
+saturate the API without competing with it for the GIL.
+
+Locust would win if the load needed real application logic — stateful journeys,
+conditional flows. Span ingest does not.
+
+### Thresholds make it a guard, not a report
+
+```javascript
+thresholds: {
+  'http_req_failed':       ['rate<0.01'],
+  'spans_ingested':        ['rate>2000'],     // the throughput guard
+  'native_ingest_latency': ['p(95)<800'],
+}
+```
+
+A report is something a human has to read and interpret, which means nobody
+does. A threshold fails the run.
+
+The **throughput** threshold matters most: latency thresholds alone would
+happily pass a build that quietly does less work. My first calibration failed
+its own latency threshold (p95 830 ms against a 500 ms bound), which is exactly
+what a threshold is for — it told me 40 clients was past the knee.
+
+### The bottleneck is deliberate
+
+One uvicorn process. That is not an oversight: the API runs one process per pod
+because `prometheus_client` holds counters in process memory (§18), so the
+platform scales **out** on replicas and an HPA rather than **up** on `--workers`.
+Measuring that properly needs a multi-node cluster, which this project does not
+pay for.
+
+### Being honest about the conditions
+
+The numbers came from a laptop running the API, Postgres and Redis together,
+with no network hop, one replica of everything, **while the host filesystem was
+at 100% capacity**.
+
+Those are stated in the README right next to the numbers, not in a footnote.
+They are not reasons to distrust the figures — they are the reasons the figures
+are a *floor for this hardware* rather than a capacity claim about the software.
+
+An interviewer who has run a benchmark will trust you more for saying so. One
+who has not will not notice either way. The asymmetry favours honesty.
+
+### What to test by hand
+
+```bash
+brew install k6
+make up
+make bench-api      # terminal 2 — API with the rate limit raised
+make bench          # terminal 3
+make bench-clean    # ~380 bytes per span; a few runs eat real disk
+```
+
+Vary the load and watch the shape rather than the peak:
+
+```bash
+BENCH_VUS=5  make bench
+BENCH_VUS=40 make bench     # same throughput, ~9x the latency
+```
+
+### Simplifications, and what production adds
+
+- **The load generator is the same laptop as the target.** They contend.
+- **No multi-replica measurement**, which is the number that actually matters
+  given the platform scales horizontally.
+- **No soak test.** Fifteen seconds says nothing about connection-pool
+  exhaustion, hypertable chunk boundaries, or memory growth over hours.
+- **No read benchmark.** Dashboard queries against a table with a billion spans
+  are a completely different question from ingest — and the more likely one to
+  disappoint.
+
+### How this reads on a résumé
+
+> Load-tested span ingest at ~3,250 spans/sec sustained (p95 < 100 ms),
+> identifying single-process saturation as the bottleneck via flat throughput
+> against linearly-rising latency.
+
+A number, a method, and a diagnosis. The diagnosis is what makes the number
+survive follow-up questions.
+
+---
+
+## 20. The SDK's two silent bugs — explained
+
+### What was asked for, and what was actually wrong
+
+The task was "add OpenAI to `instrument()`". `instrument()` wrapped Anthropic
+only, so an OpenAI client was unsupported — a real gap, since the platform had
+just gained the ability to *evaluate* against OpenAI and still could not *trace*
+it.
+
+Two bugs turned up on the way, and both were worse than the gap.
+
+### Bug one: an unsupported client traced nothing, silently
+
+The old proxy intercepted attribute access and only wrapped `messages`:
+
+```python
+def __getattr__(self, item):
+    value = getattr(self._wrapped, item)
+    if item == "messages":            # Anthropic's surface
+        return _InstrumentedMessages(value)
+    return value                      # everything else: straight through
+```
+
+An OpenAI client has no `.messages` — it uses `.chat.completions.create`. So
+`instrument(OpenAI())` returned a proxy that passed *everything* through and
+traced *nothing*.
+
+No error. No warning. An empty dashboard and nothing to search for.
+
+That is the worst failure shape available: a silent no-op in a component whose
+entire job is to make things visible.
+
+### The fix, and a rule worth generalising
+
+Detect the client and **raise** on anything unrecognised:
+
+```python
+if hasattr(client, "messages"):            return _anthropic_proxy(client)
+if hasattr(client.chat, "completions"):    return _openai_proxy(client)
+raise TypeError("instrument() does not recognise …")
+```
+
+That looks like it contradicts the SDK's headline rule — *never raise into the
+host application*. It does not, and the distinction is worth holding onto:
+
+- **The request path must never raise.** A span that cannot be recorded is
+  dropped. Losing telemetry is always better than breaking somebody's request.
+- **Setup may raise, and should.** A client that cannot be instrumented is a
+  *configuration error*, discovered once, at startup, by the person who wrote
+  the line. Silently continuing turns a five-second fix into an afternoon of
+  wondering why the dashboard is empty.
+
+"Never fail" is almost never the actual rule. "Never fail *in the hot path*" is.
+
+Detection is duck-typed on attributes rather than `isinstance`, because
+importing `anthropic` or `openai` to identify a client would put them in this
+package's dependency floor — and the SDK's whole selling point is that it
+depends on httpx alone. A test parses the module's **AST** to assert neither
+vendor is imported; a text search was tried first and flagged the docstring
+examples, which is its own small lesson about grepping for structure.
+
+### Bug two: every async call was mistraced
+
+This one is worse, because it produced *wrong data* rather than *no data*.
+
+The old code had:
+
+```python
+def create(self, **kwargs): ...          # sync
+async def acreate(self, **kwargs): ...   # async
+```
+
+No vendor SDK is shaped like that. `AsyncOpenAI` and `AsyncAnthropic` name their
+method `create` too — it simply returns a coroutine.
+
+So with an async client, the *sync* wrapper ran:
+
+```python
+with span(...) as current:
+    response = self._wrapped.create(**kwargs)   # a coroutine, not awaited
+    _record_response(current, response)         # finds no .usage — defensive, so no error
+    return response                             # caller awaits it out here
+```
+
+The span opened, found nothing to record, closed, and returned an un-awaited
+coroutine. Result: **every async call produced a span with no token counts and a
+duration of roughly zero, while the real model call went entirely untraced.**
+
+I demonstrated it before fixing it:
+
+```
+old wrapper saw: coroutine -> usage attr: False
+```
+
+**Wrong data is worse than missing data**, because nobody investigates a
+dashboard that looks fine. Missing spans get noticed; 0 ms spans get averaged.
+
+The fix decides at call time from the wrapped callable:
+
+```python
+inner = self._wrapped.create
+if inspect.iscoroutinefunction(inner):
+    async def create(**kwargs):
+        with span(...) as current:
+            response = await inner(**kwargs)     # awaited *inside* the span
+            ...
+```
+
+with tests asserting the span's duration actually covers the awaited work.
+
+### The part I argued against building
+
+The task also asked for LangChain and LlamaIndex callback handlers. I pushed
+back, and the reasoning is worth keeping because it is a *strategy* argument
+rather than a technical one:
+
+Those frameworks already have OpenTelemetry instrumentation, and §16 made this
+platform speak OTLP. So a LangChain user already has a **zero-code** path here.
+A bespoke handler would deliver the same coverage through a *worse* route — one
+requiring changes to their application — while taking on a maintenance treadmill
+every time a framework revises its callback API.
+
+There is also a positioning cost. The brief for this whole project says: *prove
+AI infrastructure skill, not another RAG app.* A repository with
+`integrations/langchain.py` in it reads as framework-adjacent. An OTLP endpoint
+reads as: *I implemented the protocol, so I do not need per-framework
+integrations.*
+
+What went in instead was ten lines of README pointing framework users at
+OpenLLMetry plus two environment variables. Cheaper, stronger, and it makes the
+OTLP work visible to someone who would otherwise go looking for a handler.
+
+**Building the thing that makes other things unnecessary is usually the better
+trade** — and being able to say why you *didn't* build something is a stronger
+interview answer than another integration.
+
+### What to test by hand
+
+```python
+from openai import AsyncOpenAI
+from llm_observatory import configure, instrument
+
+configure(api_key="lo_live_...", endpoint="http://localhost:8000")
+client = instrument(AsyncOpenAI(base_url="http://localhost:11434/v1"))
+# await client.chat.completions.create(...) → a span with real tokens and duration
+```
+
+And confirm the loud failure:
+
+```python
+instrument(object())     # TypeError naming what is supported
+```
+
+### How this reads on a résumé
+
+> Found that the tracing SDK silently mistraced every asynchronous call —
+> recording zero-duration spans while the real call went untraced — and fixed it
+> by resolving sync/async from the wrapped callable rather than from a method
+> name.
+
+Then the strategic half, which interviewers probe harder:
+
+> Declined to ship per-framework integrations because the OTLP endpoint already
+> covered those users with no code change, avoiding a maintenance surface for
+> coverage the platform already had.
+
+---
+
+## 21. Generating tests instead of writing them — explained
+
+### The idea in one paragraph
+
+An example-based test says *"given this input, expect that output"*. It proves
+the cases somebody thought of. A **property-based** test says *"for every input,
+this must hold"* — and a library (Hypothesis) generates hundreds of inputs
+trying to break it, then **shrinks** any failure to the smallest example that
+still fails.
+
+You stop writing cases and start writing invariants.
+
+### Why span-tree assembly specifically
+
+`build_tree` turns flat span rows into a tree by following `parent_span_id`
+pointers. The integration tests covered it by example: one tree, one arrival
+order, one orphan.
+
+Here is what makes examples the wrong tool here: **span ids and parent pointers
+are client-supplied.** W3C Trace Context ids are generated by the instrumented
+application, not by us. So the shapes reaching this function are bounded by what
+a buggy or hostile SDK can emit — not by what our own SDK does.
+
+Anything this function *can* be handed, it eventually *will* be handed. That is
+an input space you cannot enumerate by imagination.
+
+### The properties
+
+Four invariants, each of which must hold for every input:
+
+1. **Conservation** — every input span appears in the output exactly once.
+2. **Acyclicity** — the assembled tree contains no cycle.
+3. **Serialisability** — the result can be turned into JSON.
+4. **Order independence** — shuffling the input preserves the parent-child edges.
+
+Note that none of them mention a specific tree. They are statements about the
+*function*, not about an example.
+
+The generator draws parent pointers from *any* span id — including the span's
+own — plus ids absent from the set. That produces self-parents, cycles, forests,
+orphans and multiple roots without anyone having to think of them.
+
+### Three bugs, all already shipped
+
+**Cycles caused silent data loss.** A span naming itself as its parent, or two
+naming each other, belonged to no root *and* no orphan list. They were linked
+only to each other, and fell out of the response entirely.
+
+```
+4 spans in → 2 spans out.  No error.
+```
+
+That directly contradicted the function's own docstring, which promised a span
+is returned *"rather than dropped"* because *"hiding those spans would make a
+trace look complete when it is not"*. The code did the opposite of what its
+comment claimed, and had done since Phase 5.
+
+Hypothesis shrank it to the minimum: **one self-parenting span** — which is what
+a single off-by-one in an instrumentation library produces.
+
+**Duplicate span ids were emitted twice.** The spans table is keyed
+`(started_at, span_id)`, because Timescale requires the partitioning column in
+every unique index. So the same span id arriving with a *different timestamp* is
+two rows — and both were appended to the parent's children.
+
+**Trees deeper than 255 could not be returned at all.** Pydantic's serialiser
+refuses to descend further. So a deeply nested trace made `GET /traces/{id}`
+raise, and the whole trace became **unreadable rather than merely deep**. A
+recursive agent or a runaway loop produces one, and ingest accepts whatever
+nesting a client sends. (I binary-searched the exact limit rather than guessing:
+255.)
+
+### The fixes, briefly
+
+- **Cycles**: a three-colour walk over parent pointers marks the members of any
+  cycle; those spans are not linked to their parent — that link *is* the cycle —
+  and become orphan roots instead, with their own subtrees intact.
+- **Duplicates**: deduplicate by span id, first occurrence wins.
+- **Depth**: bounded at 200, with deeper subtrees detached as orphans. Nothing
+  is lost and the response always serialises.
+
+The depth walk is breadth-first with an explicit queue rather than recursion —
+because the input that makes the bound necessary is precisely the input that
+would overflow the stack on the way to discovering it.
+
+### Testing the tests
+
+A test that passes is not necessarily a test that *works*. So I mutated the
+source — disabling each fix in turn — and checked that the matching property
+failed.
+
+Worth reporting: **my first mutation attempt passed.** I changed
+`unique.setdefault(id, span)` to `unique[id] = span`, expecting to break
+deduplication — but both deduplicate, one just keeps the last instead of the
+first. I had to write a genuine mutation (iterate the raw list) to prove the
+duplicate property had teeth.
+
+If you take one habit from this section: **verify that a test can fail.** A
+green suite tells you nothing about tests that cannot go red.
+
+### When to reach for this
+
+Property testing is not free — the generators take thought, and failures need
+interpreting. It earns its keep when:
+
+- the input space is **adversarial or externally controlled** (here: client ids),
+- there are **invariants** worth stating (here: nothing is lost),
+- the failure mode is **silent** (here: spans vanish with no error).
+
+It is poor value for CRUD endpoints and straightforward mappings, where an
+example says everything and says it more legibly.
+
+### What to test by hand
+
+```bash
+uv run pytest tests/unit/test_span_tree_properties.py -q
+```
+
+Then break it deliberately and watch Hypothesis find the minimal case:
+
+```bash
+# In build_tree, replace the cycle detection with an empty set:
+#   cyclic = set()
+uv run pytest tests/unit/test_span_tree_properties.py -q
+# → fails, shrunk to a single self-parenting span
+```
+
+Failing examples are cached in `.hypothesis/` (gitignored) and replayed first on
+the next run, so a shrunk counterexample reproduces deterministically instead of
+waiting to be rediscovered.
+
+### How this reads on a résumé
+
+> Introduced property-based testing for span-tree assembly, where parent
+> pointers are client-supplied, and found three shipped bugs: cycles silently
+> dropped spans, duplicate ids double-counted them, and traces deeper than the
+> serialiser's limit could not be read back at all.
+
+The number is doing work there. "Added property tests" is a tool. "Found three
+shipped bugs, one of which made traces unreadable" is a result — and the
+follow-up question, *why did examples miss these?*, has a real answer about who
+controls the input.
+
+---
+
+## 22. Where to look when you're stuck
 
 - **Why was this done this way?** → `docs/adr/` — one file per decision, each
   with the alternatives I rejected and why.
@@ -2524,7 +3732,11 @@ different conversation from "I built a RAG pipeline".
   explain *why*, not restate the signature.
 - **What's the API surface?** → `http://localhost:8000/docs` while the API runs.
 - **What does correct behaviour look like?** → the tests. `tests/unit/` for
-  logic, `tests/integration/` for anything touching the database.
+  logic, `tests/integration/` for anything touching the database, and
+  `tests/unit/test_span_tree_properties.py` for the invariants that hold for
+  *every* input rather than for chosen examples.
+- **How fast is it?** → `bench/README.md`, which documents the methodology and,
+  more usefully, the caveats that apply to every number in it.
 
 The ADRs are the highest-value thing to re-read before an interview. They're
 written as arguments, not documentation.
